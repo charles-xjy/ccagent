@@ -194,10 +194,9 @@ if __name__ == "__main__":
     # 模拟一个需求
     # query = input("\033[36m请输入需求: \033[0m")
     query = "把 inplace_quick_sort.py里改为原地的快速排序算法"
-    config = {"configurable": {"thread_id": "session_v5"}}
     inputs = {"messages": [HumanMessage(content=query)], "current_todo": []}
 
-    for chunk in app.stream(inputs, config=config, stream_mode="updates"):
+    for chunk in app.stream(inputs, stream_mode="updates", version="v2"):
         for node_name, state_update in chunk.items():
             if isinstance(state_update, dict):
                 for msg in state_update.get("messages", []):
