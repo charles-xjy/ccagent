@@ -20,8 +20,38 @@ model = ChatOpenAI(
     temperature=0
 )
 
+from langchain_mcp_adapters.client import MultiServerMCPClient
+import asyncio
+
 
 # --- 1. 定义工具 ---
+async def langgraph_mcp():
+    # 3. 配置 LangChain 官方文档 MCP 服务器
+    #     这里的 URL 是你提供的官方 MCP 端点
+    mcp_servers = {
+        "langchain_docs": {
+            "url": "https://docs.langchain.com/mcp",
+            "transport": "http"
+        }
+    }
+    print(f"[*] 正在尝试连接到 LangChain 官方 MCP 服务器...")
+
+    mcp_client = MultiServerMCPClient(mcp_servers)
+    try:
+        # 获取 MCP 工具
+        mcp_tools = await mcp_client.get_tools()
+        print(f"[*] 连接成功！已加载 {len(mcp_tools)} 个文档搜索相关工具")
+        print(mcp_tools)
+    finally:
+        pass
+    return mcp_tools
+
+
+try:
+    mcp_tools = asyncio.run(langgraph_mcp())
+except KeyboardInterrupt:
+    pass
+
 
 @tool
 def bash(command: str) -> str:
@@ -114,7 +144,7 @@ def todo_manager(items: List[dict]) -> str:
     return f"任务列表已更新：\n{summary}"
 
 
-tools = [bash, read_file, write_file, edit_file, todo_manager]
+tools = [bash, read_file, write_file, edit_file, todo_manager] + mcp_tools
 tools_by_name = {t.name: t for t in tools}
 model_with_tools = model.bind_tools(tools)
 
@@ -193,7 +223,7 @@ if __name__ == "__main__":
     print("\033[32m--- 鲁棒编辑智能体（中文指令版）已就绪 ---\033[0m")
     # 模拟一个需求
     # query = input("\033[36m请输入需求: \033[0m")
-    query = "把 inplace_quick_sort.py里改为原地的快速排序算法"
+    query = "帮我写一个langgrah里面入门的agent"
     inputs = {"messages": [HumanMessage(content=query)], "current_todo": []}
 
     for chunk in app.stream(inputs, stream_mode="updates", version="v2"):

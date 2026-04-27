@@ -67,7 +67,7 @@ def write_file(path: str, content: str) -> str:
     它会自动创建不存在的中间目录。
 
     Args:
-        path: 相对路径字符串，包含文件名（例如 'scripts/hello.py' 或 'note.txt'）。
+        path: 相对路径字符串，包含文件名。
         content: 要写入文件的完整文本内容。
 
     Returns:
@@ -146,7 +146,44 @@ def todo_manager(items: List[dict]) -> str:
     return f"任务列表已更新：\n{summary}"
 
 
-tools = [bash, read_file, write_file, edit_file, todo_manager]
+"""
+==================================================================================================
+############################      2          mcp_tools        ####################################
+==================================================================================================
+"""
+from langchain_mcp_adapters.client import MultiServerMCPClient
+import asyncio
+
+
+# --- 1. 定义工具 ---
+async def langgraph_mcp():
+    # 3. 配置 LangChain 官方文档 MCP 服务器
+    #     这里的 URL 是你提供的官方 MCP 端点
+    mcp_servers = {
+        "langchain_docs": {
+            "url": "https://docs.langchain.com/mcp",
+            "transport": "http"
+        }
+    }
+    print(f"[*] 正在尝试连接到 LangChain 官方 MCP 服务器...")
+
+    mcp_client = MultiServerMCPClient(mcp_servers)
+    try:
+        # 获取 MCP 工具
+        mcp_tools = await mcp_client.get_tools()
+        print(f"[*] 连接成功！已加载 {len(mcp_tools)} 个文档搜索相关工具")
+        print(mcp_tools)
+    finally:
+        pass
+    return mcp_tools
+
+
+try:
+    mcp_tools = asyncio.run(langgraph_mcp())
+except KeyboardInterrupt:
+    pass
+
+tools = [bash, read_file, write_file, edit_file, todo_manager] + mcp_tools
 tools_by_name = {t.name: t for t in tools}
 model_with_tools = model.bind_tools(tools)
 # tools_by_name的结构如下
@@ -156,6 +193,7 @@ model_with_tools = model.bind_tools(tools)
 #     "write_file": <BaseTool对象: 代表write_file函数>,
 #     "edit_file": <BaseTool对象: 代表edit_file函数>,
 #     "todo_manager": <BaseTool对象: 代表todo_manager函数>
+#         .....
 # }
 
 
@@ -186,7 +224,7 @@ from typing import Literal
 from langgraph.graph import StateGraph, START, END
 
 
-def call_model(state: AgentState) -> dict[str, list[BaseMessage]]:
+async def call_model(state: AgentState) -> dict[str, list[BaseMessage]]:
     """LLM 决策节点"""
     todo_status = json.dumps(state.get("current_todo", []), ensure_ascii=False)
 
@@ -201,11 +239,11 @@ def call_model(state: AgentState) -> dict[str, list[BaseMessage]]:
         "4. 先读后改：在调用 'edit_file' 之前，必须先调用 'read_file' 确认文件内容，严禁凭空猜测代码内容。\n"
         "5. 错误处理：如果遇到‘多重匹配’错误，请重新读取文件并提供更长、更唯一的代码片段进行替换。"
     ))
-    response = model_with_tools.invoke([system_prompt] + state["messages"])
+    response = await model_with_tools.ainvoke([system_prompt] + state["messages"])
     return {"messages": [response]}
 
 
-def execute_tools(state: AgentState) -> dict[str, list[BaseMessage]]:
+async def execute_tools(state: AgentState) -> dict[str, list[BaseMessage]]:
     """工具执行节点转换逻辑"""
     last_message = state["messages"][-1]
     updates = {"messages": []}
@@ -219,7 +257,7 @@ def execute_tools(state: AgentState) -> dict[str, list[BaseMessage]]:
                 updates["current_todo"] = tool_call["args"]["items"]
 
             tool_func = tools_by_name[tool_call["name"]]
-            observation = tool_func.invoke(tool_call["args"])
+            observation = await tool_func.ainvoke(tool_call["args"])
 
             updates["messages"].append(ToolMessage(
                 content=str(observation),
@@ -255,24 +293,38 @@ png_data = app.get_graph(xray=True).draw_mermaid_png()
 with open("my_agent_graph.png", "wb") as f:
     f.write(png_data)
 
-if __name__ == "__main__":
-    print("==================================================================================================")
-    print("\033[32m=============================== Nano Claude Code智能体 ================================= \033[0m")
-    print("==================================================================================================")
-    # query = input("\033[36m请输入需求: \033[0m")
-    query = "把 inplace_quick_sort.py里改为原地的快速排序算法"
-    inputs = {"messages": [HumanMessage(content=query)], "current_todo": []}
 
-    for chunk in app.stream(inputs, stream_mode="updates", version="v2"):
-        if "data" in chunk:
-            # 2. 遍历 data 里的所有节点更新（比如 'agent'）
-            # .items()是字典（dict）的一个非常重要的方法。它的作用是让你同时拿到字典的“钥匙”（Key）和“柜子里的东西”（Value）。
-            for node_name, node_update in chunk["data"].items():
-                # 3. 检查该节点是否更新了 messages
-                if "messages" in node_update:
-                    # 4. 遍历消息列表
-                    for msg in node_update["messages"]:
-                        # 5. 只有消息对象才能调用 pretty_print
-                        print(
-                            f"\n================================= 节点 [{node_name}] 输出 ===============================")
-                        msg.pretty_print()
+async def main():
+    # print("==================================================================================================")
+    print("\033[32m=============================== Nano Claude Code智能体 ================================= \033[0m")
+    print("===============================请输入您的需求，输入q,exit退出=================================")
+    # print("==================================================================================================")
+
+    while True:
+        # print("===============================请输入您的需求，输入q,exit退出=================================")
+        try:
+            query = input("\033[36m >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+        # query = "帮我用langgrah实现一个简单的四则运算agent，作为学习的例子"
+        inputs = {"messages": [HumanMessage(content=query)], "current_todo": []}
+
+        async for chunk in app.astream(inputs, stream_mode="updates", version="v2"):
+            if "data" in chunk:
+                # 2. 遍历 data 里的所有节点更新（比如 'agent'）
+                # .items()是字典（dict）的一个非常重要的方法。它的作用是让你同时拿到字典的“钥匙”（Key）和“柜子里的东西”（Value）。
+                for node_name, node_update in chunk["data"].items():
+                    # 3. 检查该节点是否更新了 messages
+                    if "messages" in node_update:
+                        # 4. 遍历消息列表
+                        for msg in node_update["messages"]:
+                            # 5. 只有消息对象才能调用 pretty_print
+                            print(
+                                f"\n================================= 节点 [{node_name}] 输出 ===============================")
+                            msg.pretty_print()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
