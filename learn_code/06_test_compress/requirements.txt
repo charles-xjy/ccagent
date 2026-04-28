@@ -1,0 +1,11 @@
+# LangGraph 四则运算 Agent 项目依赖
+
+# 核心框架
+langgraph>=0.2.0
+langchain>=0.3.0
+
+# OpenAI 模型支持（可选）
+langchain-openai>=0.2.0
+
+# 其他依赖
+langchain-community>=0.3.0
