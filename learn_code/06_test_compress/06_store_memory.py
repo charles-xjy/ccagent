@@ -10,7 +10,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.memory import MemorySaver, InMemorySaver
 from langchain.agents import create_agent
 
 # =============================================================================================
@@ -116,16 +116,69 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
 @tool
 def todo_manager(items: List[dict]) -> str:
     """
-    对于任何包含多个步骤的任务，你需要先调用任务规划工具来编排任务
+    更新当前会话的任务列表
+
+    主动使用此工具来跟踪进度和管理任务执行。
+
+    ## 何时使用此工具
+    在以下场景中主动使用此工具：
+    1. 收到复杂的多步骤任务时 - 立即分解为子任务
+    2. 开始执行任务时 - 将任务标记为 in_progress
+    3. 完成任务后 - 将任务标记为 completed
+    4. 遇到错误时 - 将任务标记为 failed 并记录错误
+
+    ## 任务状态管理
+    1. **任务状态**: 使用这些状态来跟踪进度：
+       - pending: 任务尚未开始
+       - in_progress: 当前正在执行（同一时间最多3个）
+       - completed: 任务成功完成
+       - failed: 任务遇到错误
+
+    2. **任务管理规则**:
+       - 实时更新任务状态
+       - 同一时间最多1个任务处于 in_progress
+       - 必须按顺序处理任务
+       - 任务失败时，标记为 failed 并包含错误详情
+
+    3. **任务完成要求**:
+       - 只有在完全完成时才标记为 completed
+       - 如果遇到错误，标记为 failed
+       - 绝不要在以下情况标记为 completed：
+         * 实现不完整
+         * 遇到未解决的错误
+         * 找不到必要的文件或依赖
+
 
     Args:
     items: 任务对象列表。每个对象必须严格包含以下键：
            - 'id': 任务编号 (如 "1")
            - 'text': 任务描述内容
-           - 'status': 状态，只能是 "pending", "in_progress", "completed" 之一。
+           - 'status': 状态，只能是 "pending", "in_progress", "completed","failed"之一。
     """
-    summary = "\n".join([f"[{i['status']}] #{i['id']}: {i['text']}" for i in items])
-    return f"任务列表已更新：\n{summary}"
+    status_headers = {
+        "in_progress": "🔄进行中:",
+        "pending": "⏳待处理:",
+        "completed": "✅已完成:",
+        "failed": "❌失败:"
+    }
+    # 2. 逐行构造结果
+    lines = []
+    for item in items:
+        raw_status = item.get("status", "❌error")
+        # 获取对应的标题，如果模型传错了，保底显示 pending
+        header = status_headers.get(raw_status, "❌error")
+
+        tid = item.get("id", "❌id?")
+        text = item.get("text", "❌无内容")
+
+        # 拼接成你要求的格式：状态标题 + #ID + 内容
+        lines.append(f"{header} #{tid} {text}")
+
+    if not lines:
+        return "任务列表为空。"
+
+    summary = "\n".join(lines)
+    return f"--- 当前任务面板 ---\n{summary}"
 
 
 # =============================================================================================
@@ -226,6 +279,56 @@ def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
     return "__end__"
 
 
+def store_memory(config, agent):
+    import json
+
+    # 1. 获取状态快照
+    snapshot = agent.get_state(config)
+
+    # 2. 准备要写入的数据结构
+    serializable_data = {
+        # 提取配置信息
+        "config": {
+            "thread_id": snapshot.config["configurable"].get("thread_id"),
+            "checkpoint_id": snapshot.config["configurable"].get("checkpoint_id")
+        },
+        # 提取元数据
+        "metadata": snapshot.metadata,
+        # 提取消息列表
+        "messages": []
+    }
+
+    # 3. 遍历并转换消息
+    for msg in snapshot.values.get("messages", []):
+        msg_dict = {
+            "type": msg.type,
+            "content": msg.content,
+            "id": msg.id
+        }
+
+        # 如果有工具调用，也存下来
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            msg_dict["tool_calls"] = msg.tool_calls
+
+        # 如果是 ToolMessage，存下 tool_call_id
+        if msg.type == "tool":
+            msg_dict["tool_call_id"] = msg.tool_call_id
+
+        serializable_data["messages"].append(msg_dict)
+    import os
+    # 4. 写入 JSON 文件
+    if config["configurable"].get("thread_id", "main"):
+        name = config["configurable"].get("thread_id")
+    else:
+        name = "unknow_agent"
+        print("❌没有配置agent存档,默认命名为unknow_agent")
+    os.makedirs("./memory", exist_ok=True)
+    with open(f"./memory/{name}_agent_state.json", "w", encoding="utf-8") as f:
+        json.dump(serializable_data, f, ensure_ascii=False, indent=4)
+
+    print(f"状态已成功写入{config["configurable"].get("thread_id")}_agent_state.json")
+
+
 # =============================================================================================
 # 5. 主程序与子 Agent 初始化 (架构初始化层)
 # =============================================================================================
@@ -256,11 +359,12 @@ async def main():
         }
     ]
 
+    checkpointer = InMemorySaver()
     for cfg in sub_configs:
         # 使用 create_react_agent 包装子 Agent 为独立的闭环 Graph
         agent_type = str(cfg["type"])
         _agent_instances[agent_type] = create_agent(
-            model, tools=cfg["tools"], system_prompt=cfg["prompt"]
+            model, checkpointer=checkpointer, tools=cfg["tools"], system_prompt=cfg["prompt"]
         )
 
     # D. 定义 TaskTool (Manager 委派专家的专属工具)
@@ -275,11 +379,18 @@ async def main():
             return f"Error: 找不到类型为 '{subagent_type}' 的专家。"
 
         print(f"\n\033[35m[系统] >>> 子 Agent ({subagent_type}) 开始工作...\033[0m")
-
+        from datetime import datetime
+        now = datetime.now()
         full_subagent_output = ""
+        sub_agent_config = {
+            "configurable": {
+                "thread_id": f"{subagent_type}_{now}",
+            }
+        }
 
         # --- 核心改进：使用 astream 实时打印子 Agent 的过程 ---
-        async for chunk in agent.astream({"messages": [HumanMessage(content=description)]}, stream_mode="updates"):
+        async for chunk in agent.astream({"messages": [HumanMessage(content=description)]}, config=sub_agent_config,
+                                         stream_mode="updates"):
             for node, data in chunk.items():
                 # 打印当前正在运行的子节点名（例如 'agent' 或 'tools'）
                 print(f"  \033[34m└─ [{subagent_type}.{node}]\033[0m 正在处理...")
@@ -295,7 +406,7 @@ async def main():
                                 print(f"    \033[32m工具调用: {tc['name']}\033[0m")
                         # 捕获最后的输出作为返回报告
                         full_subagent_output = msg.content
-
+        store_memory(sub_agent_config, agent)
         print(f"\033[35m[系统] <<< 子 Agent ({subagent_type}) 任务完成。\033[0m")
         return f"--- SubAgent [{subagent_type}] 执行报告 ---\n\n{full_subagent_output}"
 
@@ -347,6 +458,8 @@ async def main():
                         # 过滤 ToolMessage 以保持终端简洁，只打印 AI 决策
                         print(f"\n--- 节点 [{node_name}] 输出 ---")
                         msg.pretty_print()
+
+    store_memory(session_config, app)
 
 
 if __name__ == "__main__":

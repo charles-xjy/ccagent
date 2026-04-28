@@ -290,7 +290,7 @@ app = workflow.compile()
 # 这里的 app 是代码里编译后的工作流对象
 png_data = app.get_graph(xray=True).draw_mermaid_png()
 
-with open("my_agent_graph.png", "wb") as f:
+with open("../my_agent_graph.png", "wb") as f:
     f.write(png_data)
 
 
@@ -306,8 +306,7 @@ async def main():
             query = input("\033[36m >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):
-            break
+        if query.strip().lower() in ("q", "exit", ""):            break
         # query = "帮我用langgrah实现一个简单的四则运算agent，作为学习的例子"
         inputs = {"messages": [HumanMessage(content=query)], "current_todo": []}
 

@@ -6,10 +6,8 @@
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import json
 
-from test_prettyprint import agent
-from langchain.messages import HumanMessage
+from learn_code.test.test_prettyprint import agent
 
 app = FastAPI()
 

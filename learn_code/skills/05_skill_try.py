@@ -65,7 +65,7 @@ def load_skills_from_directory(directory_path: str) -> List[Skill]:
 
 # 假设你的技能文件放在当前目录下的 'skills_data' 文件夹中
 # 你可以在该文件夹下创建 sales_analytics.md, inventory_management.md 等
-SKILLS_DIR = "./skills/claude_code"
+SKILLS_DIR = "claude_code"
 SKILLS: List[Skill] = load_skills_from_directory(SKILLS_DIR)
 
 
