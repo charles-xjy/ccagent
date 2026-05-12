@@ -3,22 +3,22 @@ import json
 import operator
 import subprocess
 from pathlib import Path
-from typing import Annotated, List, Literal, TypedDict, Dict, Any, Optional
+from typing import Annotated, List, Literal, TypedDict, Dict
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.graph import StateGraph, START, END
+# from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import StateGraph, START
 from langgraph.checkpoint.memory import MemorySaver
-from langchain.agents import create_agent
 
 # =============================================================================================
 # 1. 配置模型
 # =============================================================================================
 # 使用 init_chat_model 灵活配置模型，确保与本地 vLLM 端口对接
 model = init_chat_model(
-    base_url="http://localhost:8001/v1",
+    base_url="http://10.129.107.145:8001/v1",
     api_key="vllm-no-key",
     model="Qwen_agent",
     model_provider="openai",
@@ -189,13 +189,9 @@ class AgentState(TypedDict):
     current_todo: List[dict]
 
 
-_agent_instances = {}
-_tools_by_name = {}
-_model_with_tools = None
-
-
 async def fetch_mcp_tools():
     """连接远程 MCP 服务器并获取动态工具"""
+    # 临时禁用 MCP 以解决未解析引用的错误，后续如果需要可以安装 langchain_mcp_adapters 并解开注释
     mcp_servers = {
         "langchain_docs": {
             "url": "https://docs.langchain.com/mcp",
@@ -208,75 +204,66 @@ async def fetch_mcp_tools():
     except Exception as e:
         print(f"[!] MCP 连接失败: {e}")
         return []
+    return []
 
 
 # =============================================================================================
-# 4. 定义图节点 (异步管理层)
+# 4. 创建子图的工厂函数
 # =============================================================================================
+def create_subgraph_runnable(model, tools: list, system_prompt: str):
+    """
+    动态创建一个可运行的 LangGraph 子图作为独立的 agent。
+    """
+    # 绑定工具
+    model_with_tools = model.bind_tools(tools)
+    tools_by_name = {t.name: t for t in tools}
 
-async def call_model(state: AgentState) -> Dict:
-    """主 Agent (Manager) 节点：负责分析、规划、委派"""
-    todo_status = json.dumps(state.get("current_todo", []), ensure_ascii=False)
+    async def call_sub_model(state: AgentState) -> Dict:
+        messages = state["messages"]
+        # 确保第一条消息是系统提示
+        if not messages or not isinstance(messages[0], SystemMessage):
+            messages = [SystemMessage(content=system_prompt)] + messages
+        response = await model_with_tools.ainvoke(messages)
+        return {"messages": [response]}
 
-    system_prompt = SystemMessage(content=(
-        f"你是一个高级编程协调员 (Manager)。当前工作路径: {WORKDIR}\n"
-        f"当前任务计划进度: {todo_status}\n\n"
-        "核心操作守则：\n"
-        "1. 规划优先：面对复杂任务，必须先调用 'todo_manager' 编排分步计划。\n"
-        "2. 专家委派：你自己不直接写代码或查文档。请通过 'task_tool' 指挥专家：\n"
-        "   - 查阅 LangChain/LangGraph 技术资料 -> 调用 'tech-researcher'\n"
-        "   - 编写、修改、测试代码或运行 Bash -> 调用 'coder'\n"
-        "3. 状态闭环：开始执行步骤前更新为 'in_progress'，完成后更新为 'completed'。\n"
-        "4. 严谨性：在委派 'coder' 修改文件前，必须确保自己或专家已调用过 'read_file'。"
-    ))
+    async def execute_sub_tools(state: AgentState) -> Dict:
+        last_message = state["messages"][-1]
+        updates = {"messages": []}
 
-    # 上下文管理：保留最近 12 条消息，避免超出模型 8192 token 限制
-    messages = state["messages"]
+        if hasattr(last_message, "tool_calls"):
+            for tool_call in last_message.tool_calls:
+                name = tool_call["name"]
+                tool_obj = tools_by_name.get(name)
+                if not tool_obj:
+                    observation = f"Error: 工具 '{name}' 未在系统中注册。"
+                else:
+                    try:
+                        observation = await tool_obj.ainvoke(tool_call["args"])
+                        if isinstance(observation, str) and len(observation) > 10000:
+                            observation = observation[:10000] + "\n... (内容过长，已自动截断)"
+                    except Exception as e:
+                        observation = f"Error executing {name}: {e}"
 
-    # 异步调用模型
-    response = await _model_with_tools.ainvoke([system_prompt] + messages)
-    return {"messages": [response]}
+                updates["messages"].append(ToolMessage(
+                    content=str(observation),
+                    tool_call_id=tool_call["id"]
+                ))
+        return updates
 
+    def should_continue_sub(state: AgentState) -> Literal["tools", "__end__"]:
+        last_message = state["messages"][-1]
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            return "tools"
+        return "__end__"
 
-async def execute_tools(state: AgentState) -> Dict:
-    """工具分发节点：异步执行工具并反馈结果"""
-    last_message = state["messages"][-1]
-    updates = {"messages": []}
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", call_sub_model)
+    builder.add_node("tools", execute_sub_tools)
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", should_continue_sub)
+    builder.add_edge("tools", "agent")
 
-    if hasattr(last_message, "tool_calls"):
-        for tool_call in last_message.tool_calls:
-            name = tool_call["name"]
-            print(f"\n\033[33m[Manager 正在分派工具: {name}]\033[0m")
-
-            if name == "todo_manager":
-                updates["current_todo"] = tool_call["args"]["items"]
-
-            tool_obj = _tools_by_name.get(name)
-            if not tool_obj:
-                observation = f"Error: 工具 '{name}' 未在系统中注册。"
-            else:
-                try:
-                    # 异步执行工具
-                    observation = await tool_obj.ainvoke(tool_call["args"])
-                    # 输出截断保护
-                    if isinstance(observation, str) and len(observation) > 10000:
-                        observation = observation[:10000] + "\n... (内容过长，已自动截断)"
-                except Exception as e:
-                    observation = f"Error executing {name}: {e}"
-
-            updates["messages"].append(ToolMessage(
-                content=str(observation),
-                tool_call_id=tool_call["id"]
-            ))
-    return updates
-
-
-def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
-    """条件边判断逻辑"""
-    last_message = state["messages"][-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "tools"
-    return "__end__"
+    return builder.compile()
 
 
 # =============================================================================================
@@ -284,8 +271,6 @@ def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
 # =============================================================================================
 
 async def main():
-    global _tools_by_name, _model_with_tools, _agent_instances
-
     print("\033[34m[*] 系统正在启动...\033[0m")
 
     # A. 动态加载 MCP 工具
@@ -309,10 +294,11 @@ async def main():
         }
     ]
 
+    agent_instances = {}
     for cfg in sub_configs:
-        # 使用 create_react_agent 包装子 Agent 为独立的闭环 Graph
+        # 使用自定义的子图工厂函数替换 create_agent
         agent_type = str(cfg["type"])
-        _agent_instances[agent_type] = create_agent(
+        agent_instances[agent_type] = create_subgraph_runnable(
             model, tools=cfg["tools"], system_prompt=cfg["prompt"]
         )
 
@@ -323,7 +309,7 @@ async def main():
         委派复杂的专项任务给专家处理。
         subagent_type 必须是 'tech-researcher' 或 'coder'。
         """
-        agent = _agent_instances.get(subagent_type)
+        agent = agent_instances.get(subagent_type)
         if not agent:
             return f"Error: 找不到类型为 '{subagent_type}' 的专家。"
 
@@ -331,10 +317,9 @@ async def main():
 
         full_subagent_output = ""
 
-        # --- 核心改进：使用 astream 实时打印子 Agent 的过程 ---
+        # --- 使用 astream 实时打印子图 (subagent) 的过程 ---
         async for chunk in agent.astream({"messages": [HumanMessage(content=description)]}, stream_mode="updates"):
             for node, data in chunk.items():
-                # 打印当前正在运行的子节点名（例如 'agent' 或 'tools'）
                 print(f"  \033[34m└─ [{subagent_type}.{node}]\033[0m 正在处理...")
 
                 if "messages" in data:
@@ -347,27 +332,84 @@ async def main():
                             for tc in msg.tool_calls:
                                 print(f"    \033[32m工具调用: {tc['name']}\033[0m")
                         # 捕获最后的输出作为返回报告
-                        full_subagent_output = msg.content
+                        if isinstance(msg, AIMessage):
+                            full_subagent_output = msg.content
 
         print(f"\033[35m[系统] <<< 子 Agent ({subagent_type}) 任务完成。\033[0m")
         return f"--- SubAgent [{subagent_type}] 执行报告 ---\n\n{full_subagent_output}"
 
     # E. 配置主 Agent (Manager 层) 的可见工具
-    # 主 Agent 不直接写代码，它只有：规划、委派、读取和查文档的能力
     manager_tools = [todo_manager, task_tool]
-    _model_with_tools = model.bind_tools(manager_tools)
+    model_with_tools = model.bind_tools(manager_tools)
 
-    # F. 全局工具索引 (供 execute_tools 节点查找)
-    all_atomic_tools = all_atomic_tools + manager_tools
-    _tools_by_name = {t.name: t for t in all_atomic_tools}
+    # F. 全局工具索引 (供主图 execute_tools 节点查找)
+    all_manager_tools = manager_tools
+    tools_by_name = {t.name: t for t in all_manager_tools}
+
+    # =============================================================================================
+    # 定义主图 (Manager) 节点 (闭包内，避免全局变量)
+    # =============================================================================================
+    async def call_manager_model(state: AgentState) -> Dict:
+        todo_status = json.dumps(state.get("current_todo", []), ensure_ascii=False)
+
+        system_prompt = SystemMessage(content=(
+            f"你是一个高级编程协调员 (Manager)。当前工作路径: {WORKDIR}\n"
+            f"当前任务计划进度: {todo_status}\n\n"
+            "核心操作守则：\n"
+            "1. 规划优先：面对复杂任务，必须先调用 'todo_manager' 编排分步计划。\n"
+            "2. 专家委派：你自己不直接写代码或查文档。请通过 'task_tool' 指挥专家：\n"
+            "   - 查阅 LangChain/LangGraph 技术资料 -> 调用 'tech-researcher'\n"
+            "   - 编写、修改、测试代码或运行 Bash -> 调用 'coder'\n"
+            "3. 状态闭环：开始执行步骤前更新为 'in_progress'，完成后更新为 'completed'。\n"
+            "4. 严谨性：在委派 'coder' 修改文件前，必须确保自己或专家已调用过 'read_file'。"
+        ))
+
+        messages = state["messages"]
+        response = await model_with_tools.ainvoke([system_prompt] + messages)
+        return {"messages": [response]}
+
+    async def execute_manager_tools(state: AgentState) -> Dict:
+        last_message = state["messages"][-1]
+        updates = {"messages": []}
+
+        if hasattr(last_message, "tool_calls"):
+            for tool_call in last_message.tool_calls:
+                name = tool_call["name"]
+                print(f"\n\033[33m[Manager 正在分派工具: {name}]\033[0m")
+
+                if name == "todo_manager":
+                    updates["current_todo"] = tool_call["args"]["items"]
+
+                tool_obj = tools_by_name.get(name)
+                if not tool_obj:
+                    observation = f"Error: 工具 '{name}' 未在系统中注册。"
+                else:
+                    try:
+                        observation = await tool_obj.ainvoke(tool_call["args"])
+                        if isinstance(observation, str) and len(observation) > 10000:
+                            observation = observation[:10000] + "\n... (内容过长，已自动截断)"
+                    except Exception as e:
+                        observation = f"Error executing {name}: {e}"
+
+                updates["messages"].append(ToolMessage(
+                    content=str(observation),
+                    tool_call_id=tool_call["id"]
+                ))
+        return updates
+
+    def should_continue_manager(state: AgentState) -> Literal["tools", "__end__"]:
+        last_message = state["messages"][-1]
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            return "tools"
+        return "__end__"
 
     # G. 构建 LangGraph 状态图
     builder = StateGraph(AgentState)
-    builder.add_node("agent", call_model)
-    builder.add_node("tools", execute_tools)
+    builder.add_node("agent", call_manager_model)
+    builder.add_node("tools", execute_manager_tools)
 
     builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", should_continue)
+    builder.add_conditional_edges("agent", should_continue_manager)
     builder.add_edge("tools", "agent")
 
     # 持久化记忆
@@ -407,3 +449,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+# 帮我写一个hello word
