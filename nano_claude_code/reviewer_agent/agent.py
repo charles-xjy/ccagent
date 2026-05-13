@@ -4,22 +4,23 @@ from langgraph.graph import StateGraph, START
 
 from core.state import AgentState
 from core.tools import read_file
-from coder_agent.tools import bash, write_file, edit_file
+from reviewer_agent.tools import run_python_test, run_bash_command, check_code_style
 
-def create_coder_agent(model, checkpointer):
-    tools = [read_file, bash, write_file, edit_file]
+
+def create_reviewer_agent(model, checkpointer):
+    tools = [read_file, run_python_test, run_bash_command, check_code_style]
     system_prompt = (
-        "你是一个编程专家。你的唯一职责是编写和修改代码文件。\n"
+        "你是一个代码审查专家。你的职责是审查代码的正确性、安全性和代码风格。\n"
         "你可以使用以下工具：\n"
-        "1. read_file — 在修改前先阅读文件内容\n"
-        "2. write_file — 创建新文件\n"
-        "3. edit_file — 精确替换文件中的片段\n"
-        "4. bash — 仅用于只读文件系统操作（如 ls、cat、grep、find），帮助定位文件或查看目录结构\n\n"
-        "严格限制：\n"
-        "- 绝对禁止运行任何 Python 脚本、测试或编译命令（如 python、pytest、npm test、make 等）\n"
-        "- 绝对禁止调用 todo_manager 更新任务状态\n"
-        "- 你的输出就是写完代码后的简短总结，交给 Manager 判断是否需要审查\n"
-        "- 确保代码可读且高效"
+        "1. read_file — 读取需要审查的代码文件\n"
+        "2. run_python_test — 运行 Python 单元测试并查看结果\n"
+        "3. check_code_style — 检查代码语法和基础规范\n"
+        "4. run_bash_command — 执行只读辅助命令（如 grep、ls 等）\n\n"
+        "审查流程：\n"
+        "- 先阅读代码文件，理解逻辑\n"
+        "- 必要时运行测试验证功能正确性\n"
+        "- 检查潜在的安全风险、错误处理、边界情况\n"
+        "- 输出结构化的审查报告，包含问题清单和改进建议"
     )
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}
@@ -47,7 +48,9 @@ def create_coder_agent(model, checkpointer):
                             observation = observation[:10000] + "\n... (内容过长，已自动截断)"
                     except Exception as e:
                         observation = f"Error executing {name}: {e}"
-                updates["messages"].append(ToolMessage(content=str(observation), tool_call_id=tool_call["id"]))
+                updates["messages"].append(
+                    ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
+                )
         return updates
 
     def should_continue_sub(state: AgentState) -> Literal["tools", "__end__"]:

@@ -302,6 +302,25 @@ async def main():
             model, tools=cfg["tools"], system_prompt=cfg["prompt"]
         )
 
+        # --- 保存子图到本地 ---
+        subgraph = agent_instances[agent_type]
+        try:
+            sub_image = subgraph.get_graph().draw_mermaid_png()
+            filename = f"subagent_{agent_type}_graph.png"
+            with open(filename, "wb") as f:
+                f.write(sub_image)
+            print(f"\033[32m[OK] 子图 ({agent_type}) 已保存至 {filename}\033[0m")
+        except Exception as e:
+            print(f"\033[33m[!] 子图 ({agent_type}) 无法生成 PNG: {e}\033[0m")
+            try:
+                mermaid_text = subgraph.get_graph().draw_mermaid()
+                filename = f"subagent_{agent_type}_graph.mmd"
+                with open(filename, "w") as f:
+                    f.write(mermaid_text)
+                print(f"\033[32m[OK] 子图 ({agent_type}) Mermaid 已保存至 {filename}\033[0m")
+            except Exception as e2:
+                print(f"\033[31m[!] 子图 ({agent_type}) 保存 Mermaid 也失败: {e2}\033[0m")
+
     # D. 定义 TaskTool (Manager 委派专家的专属工具)
     @tool
     async def task_tool(description: str, subagent_type: str) -> str:
@@ -361,7 +380,9 @@ async def main():
             "   - 查阅 LangChain/LangGraph 技术资料 -> 调用 'tech-researcher'\n"
             "   - 编写、修改、测试代码或运行 Bash -> 调用 'coder'\n"
             "3. 状态闭环：开始执行步骤前更新为 'in_progress'，完成后更新为 'completed'。\n"
-            "4. 严谨性：在委派 'coder' 修改文件前，必须确保自己或专家已调用过 'read_file'。"
+            "4. 审查强制：'coder' 完成代码编写/修改后，你必须立即调用 'reviewer' 对该代码进行审查。\n"
+            "   reviewer 会运行测试、检查代码质量。只有 reviewer 确认通过后，才能将任务标记为 completed。\n"
+            "5. 严谨性：在委派 'coder' 修改文件前，必须确保自己或专家已调用过 'read_file'。"
         ))
 
         messages = state["messages"]
@@ -415,6 +436,22 @@ async def main():
     # 持久化记忆
     checkpointer = MemorySaver()
     app = builder.compile(checkpointer=checkpointer)
+
+    # --- 保存主图 (Manager) 到本地 ---
+    try:
+        graph_image = app.get_graph().draw_mermaid_png()
+        with open("manager_graph.png", "wb") as f:
+            f.write(graph_image)
+        print("\033[32m[OK] 主图 (Manager) 已保存至 manager_graph.png\033[0m")
+    except Exception as e:
+        print(f"\033[33m[!] 无法生成 PNG (可能缺少 graphviz): {e}\033[0m")
+        try:
+            mermaid_text = app.get_graph().draw_mermaid()
+            with open("manager_graph.mmd", "w") as f:
+                f.write(mermaid_text)
+            print("\033[32m[OK] 主图 (Manager) Mermaid 已保存至 manager_graph.mmd\033[0m")
+        except Exception as e2:
+            print(f"\033[31m[!] 保存 Mermaid 也失败: {e2}\033[0m")
 
     print("\033[32m[OK] Nano Claude Code (Manager/Executor 架构) 已就绪。\033[0m")
 

@@ -296,8 +296,7 @@ main_agent_config = {
 }
 checkpointer = InMemorySaver()
 app = workflow.compile(checkpointer=checkpointer)
-# 这里的 app 是代码里编译后的工作流对象
-png_data = app.get_graph(xray=True).draw_mermaid_png()
+png_data = app.get_graph().draw_mermaid_png()
 
 with open("../my_agent_graph.png", "wb") as f:
     f.write(png_data)
