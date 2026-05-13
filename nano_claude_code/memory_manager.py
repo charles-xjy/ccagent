@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -10,12 +11,46 @@ from core import prompt_ui
 
 DB_URI = "redis://10.129.107.145:6379"
 
-THREADS = {
-    "1": ("主 Agent (Manager)", "manager_executor_v2"),
-    "2": ("编程专家 (Coder)", "manager_executor_v2_coder"),
-    "3": ("调研专家 (Researcher)", "manager_executor_v2_tech-researcher"),
-    "4": ("代码审核专家 (Reviewer)", "manager_executor_v2_reviewer"),
-}
+# session_YYYYMMDD_HHMM 格式的会话 ID
+_SESSION_RE = re.compile(r'session_\d{8}_\d{4}')
+
+# 旧格式 thread ID 前缀
+_LEGACY_BASE = "manager_executor_v2"
+_LEGACY_THREAD_IDS = [
+    _LEGACY_BASE,
+    f"{_LEGACY_BASE}_coder",
+    f"{_LEGACY_BASE}_tech-researcher",
+    f"{_LEGACY_BASE}_reviewer",
+]
+
+_ROLE_SUFFIXES = [
+    ("",                  "主 Agent (Manager)"),
+    ("_coder",            "编程专家 (Coder)"),
+    ("_tech-researcher",  "调研专家 (Researcher)"),
+    ("_reviewer",         "代码审核专家 (Reviewer)"),
+]
+
+
+async def _scan_sessions(r) -> tuple:
+    """
+    扫描 Redis，返回 (base_sessions, legacy_ids)：
+      base_sessions — session_YYYYMMDD_HHMM 基础 ID 列表，倒序（最新在前）
+      legacy_ids    — 旧格式 thread ID 列表（仅返回 Redis 中实际存在的）
+    """
+    all_keys = await r.keys("*")
+
+    # 新格式
+    base_ids = set()
+    for k in all_keys:
+        m = _SESSION_RE.search(k)
+        if m:
+            base_ids.add(m.group())
+
+    # 旧格式：检查 Redis 里是否真的有对应 key
+    legacy = [tid for tid in _LEGACY_THREAD_IDS
+              if any(tid in k for k in all_keys)]
+
+    return sorted(base_ids, reverse=True), legacy
 
 
 # ─────────────────────────────────────────────────────────────
@@ -371,23 +406,70 @@ async def main():
         DB_URI
     ) as ltm:
         while True:
-            top_choices = [
-                (f"{name}  (ID: {tid})", key) for key, (name, tid) in THREADS.items()
-            ]
-            top_choices += [("长期记忆管理", "5"), ("退出", "q")]
+            # 动态扫描 Redis 中的会话 ID
+            r_scan = redis.from_url(DB_URI, decode_responses=True)
+            base_sessions, legacy_ids = await _scan_sessions(r_scan)
+            await r_scan.aclose()
 
-            choice = await prompt_ui.select("记忆管理器 — 请选择：", top_choices)
+            total = len(base_sessions) + len(legacy_ids)
+            session_choices = [
+                (f"{sid}", f"new:{sid}") for sid in base_sessions
+            ]
+            if legacy_ids:
+                session_choices += [
+                    (f"[旧] {tid}", f"legacy:{tid}") for tid in legacy_ids
+                ]
+            session_choices += [("长期记忆管理", "__ltm__"), ("退出", "q")]
+
+            choice = await prompt_ui.select(
+                f"记忆管理器 — 共 {total} 条会话记录：",
+                session_choices,
+            )
 
             if choice == "q":
                 break
 
-            if choice == "5":
+            if choice == "__ltm__":
                 await manage_long_term_memories(ltm)
                 continue
 
-            name, tid = THREADS[choice]
+            if choice.startswith("legacy:"):
+                # 旧格式：直接操作该 thread_id
+                tid = choice[len("legacy:"):]
+                action = await prompt_ui.select(
+                    f"[旧] {tid}：",
+                    [
+                        ("查看记忆", "1"),
+                        ("删除记忆", "2"),
+                        ("返回", "q"),
+                    ],
+                )
+                if action == "q":
+                    continue
+                elif action == "1":
+                    await view_memory(checkpointer, tid)
+                elif action == "2":
+                    await delete_checkpoints(checkpointer, tid)
+                continue
+
+            # 新格式：展示子 Agent 列表
+            base_sid = choice[len("new:"):]
+            agent_choices = [
+                (f"{label}  ({base_sid}{suffix})", f"{base_sid}{suffix}")
+                for suffix, label in _ROLE_SUFFIXES
+            ]
+            agent_choices.append(("返回", "q"))
+
+            agent_choice = await prompt_ui.select(
+                f"会话 {base_sid} — 选择 Agent：",
+                agent_choices,
+            )
+            if agent_choice == "q":
+                continue
+
+            tid = agent_choice
             action = await prompt_ui.select(
-                f"{name}：",
+                f"{tid}：",
                 [
                     ("查看记忆", "1"),
                     ("删除记忆", "2"),
