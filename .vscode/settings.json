@@ -1,4 +1,15 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "terminal.integrated.env.windows": {
+        "HTTP_PROXY": "http://127.0.0.1:7897",
+        "HTTPS_PROXY": "http://127.0.0.1:7897",
+        "ALL_PROXY": "http://127.0.0.1:7897"
+    },
+    "http.proxy": "http://127.0.0.1:7897",
+    "http.proxySupport": "override",
+    "claudeCode.env": {
+        "HTTPS_PROXY": "http://127.0.0.1:7897",
+        "HTTP_PROXY": "http://127.0.0.1:7897"
+    }
 }

@@ -4,7 +4,11 @@ from langgraph.graph import StateGraph, START
 
 from core.state import AgentState
 from core.tools import read_file
+from core.confirm import create_tool_confirm_node, make_agent_router, route_after_tool_confirm
 from coder_agent.tools import bash, write_file, edit_file
+from compressor import create_compression_node, create_warn_node, make_token_router, route_after_warn
+
+_DANGEROUS = {"write_file", "edit_file"}
 
 def create_coder_agent(model, checkpointer):
     tools = [read_file, bash, write_file, edit_file]
@@ -50,17 +54,22 @@ def create_coder_agent(model, checkpointer):
                 updates["messages"].append(ToolMessage(content=str(observation), tool_call_id=tool_call["id"]))
         return updates
 
-    def should_continue_sub(state: AgentState) -> Literal["tools", "__end__"]:
-        last_message = state["messages"][-1]
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            return "tools"
-        return "__end__"
+    _router = make_token_router()
+    _agent_router = make_agent_router(_DANGEROUS)
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", call_sub_model)
+    builder.add_node("tool_confirm", create_tool_confirm_node(_DANGEROUS, "Coder"))
     builder.add_node("tools", execute_sub_tools)
+    builder.add_node("warn", create_warn_node())
+    builder.add_node("compress", create_compression_node(model))
     builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", should_continue_sub)
-    builder.add_edge("tools", "agent")
+    builder.add_conditional_edges("agent", _agent_router,
+                                  {"tool_confirm": "tool_confirm", "tools": "tools", "__end__": "__end__"})
+    builder.add_conditional_edges("tool_confirm", route_after_tool_confirm,
+                                  {"tools": "tools", "agent": "agent"})
+    builder.add_conditional_edges("tools", _router, {"compress": "compress", "warn": "warn", "agent": "agent"})
+    builder.add_conditional_edges("warn", route_after_warn, {"compress": "compress", "agent": "agent"})
+    builder.add_edge("compress", "agent")
 
     return builder.compile(checkpointer=checkpointer)

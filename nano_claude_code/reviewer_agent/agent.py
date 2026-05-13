@@ -4,23 +4,32 @@ from langgraph.graph import StateGraph, START
 
 from core.state import AgentState
 from core.tools import read_file
-from reviewer_agent.tools import run_python_test, run_bash_command, check_code_style
+from core.confirm import create_tool_confirm_node, make_agent_router, route_after_tool_confirm
+from reviewer_agent.tools import run_in_sandbox, run_python_test, run_bash_command, check_code_style
+from compressor import create_compression_node, create_warn_node, make_token_router, route_after_warn
+
+_DANGEROUS = {"run_in_sandbox", "run_python_test"}
 
 
 def create_reviewer_agent(model, checkpointer):
-    tools = [read_file, run_python_test, run_bash_command, check_code_style]
+    tools = [read_file, run_in_sandbox, run_python_test, run_bash_command, check_code_style]
     system_prompt = (
         "你是一个代码审查专家。你的职责是审查代码的正确性、安全性和代码风格。\n"
         "你可以使用以下工具：\n"
-        "1. read_file — 读取需要审查的代码文件\n"
-        "2. run_python_test — 运行 Python 单元测试并查看结果\n"
-        "3. check_code_style — 检查代码语法和基础规范\n"
-        "4. run_bash_command — 执行只读辅助命令（如 grep、ls 等）\n\n"
+        "1. read_file        — 读取需要审查的代码文件\n"
+        "2. run_in_sandbox   — 【唯一合法的代码执行工具】在隔离 venv 中运行代码或测试\n"
+        "3. check_code_style — 检查代码语法和基础规范（无需执行）\n"
+        "4. run_bash_command — 仅用于只读文件操作：ls、grep、cat、find 等\n"
+        "5. run_python_test  — 仅在明确知道环境已安装依赖时才使用\n\n"
+        "严格限制：\n"
+        "- 【禁止】使用 run_bash_command 执行任何 Python 脚本（python xxx.py）\n"
+        "- 【禁止】使用 run_bash_command 运行测试（pytest、unittest 等）\n"
+        "- 所有代码执行、测试运行，必须且只能通过 run_in_sandbox 完成\n\n"
         "审查流程：\n"
-        "- 先阅读代码文件，理解逻辑\n"
-        "- 必要时运行测试验证功能正确性\n"
-        "- 检查潜在的安全风险、错误处理、边界情况\n"
-        "- 输出结构化的审查报告，包含问题清单和改进建议"
+        "1. read_file 阅读代码，理解逻辑\n"
+        "2. check_code_style 做语法检查\n"
+        "3. run_in_sandbox 运行测试验证正确性（这是执行代码的唯一方式）\n"
+        "4. 输出结构化审查报告，包含问题清单和改进建议"
     )
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}
@@ -53,17 +62,22 @@ def create_reviewer_agent(model, checkpointer):
                 )
         return updates
 
-    def should_continue_sub(state: AgentState) -> Literal["tools", "__end__"]:
-        last_message = state["messages"][-1]
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            return "tools"
-        return "__end__"
+    _router = make_token_router()
+    _agent_router = make_agent_router(_DANGEROUS)
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", call_sub_model)
+    builder.add_node("tool_confirm", create_tool_confirm_node(_DANGEROUS, "Reviewer"))
     builder.add_node("tools", execute_sub_tools)
+    builder.add_node("warn", create_warn_node())
+    builder.add_node("compress", create_compression_node(model))
     builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", should_continue_sub)
-    builder.add_edge("tools", "agent")
+    builder.add_conditional_edges("agent", _agent_router,
+                                  {"tool_confirm": "tool_confirm", "tools": "tools", "__end__": "__end__"})
+    builder.add_conditional_edges("tool_confirm", route_after_tool_confirm,
+                                  {"tools": "tools", "agent": "agent"})
+    builder.add_conditional_edges("tools", _router, {"compress": "compress", "warn": "warn", "agent": "agent"})
+    builder.add_conditional_edges("warn", route_after_warn, {"compress": "compress", "agent": "agent"})
+    builder.add_edge("compress", "agent")
 
     return builder.compile(checkpointer=checkpointer)

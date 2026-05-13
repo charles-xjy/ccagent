@@ -1,7 +1,12 @@
 import asyncio
+import sys
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import json
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 import redis.asyncio as redis
+from long_term_memory import LongTermMemory, MEMORY_TYPES, _TYPE_LABELS
+from core import prompt_ui
 
 DB_URI = "redis://10.129.107.145:6379"
 
@@ -13,8 +18,12 @@ THREADS = {
 }
 
 
+# ─────────────────────────────────────────────────────────────
+# 内部工具函数
+# ─────────────────────────────────────────────────────────────
+
+
 async def _collect_checkpoints(checkpointer: AsyncRedisSaver, thread_id: str):
-    """收集线程的所有检查点"""
     config = {"configurable": {"thread_id": thread_id}}
     checkpoints = []
     try:
@@ -26,7 +35,6 @@ async def _collect_checkpoints(checkpointer: AsyncRedisSaver, thread_id: str):
 
 
 def _get_messages_from_checkpoint(checkpoint):
-    """从 checkpoint 对象中提取消息列表（兼容 dict 和 dataclass）。"""
     try:
         if isinstance(checkpoint, dict):
             channel_values = checkpoint.get("channel_values", {})
@@ -40,7 +48,6 @@ def _get_messages_from_checkpoint(checkpoint):
 
 
 async def _show_messages(messages, start_label: int = 1):
-    """完整打印消息列表，不截断内容"""
     if not messages:
         print("消息列表为空。")
         return
@@ -48,16 +55,15 @@ async def _show_messages(messages, start_label: int = 1):
         content = msg.content if hasattr(msg, "content") else msg.get("content", "")
         if isinstance(content, list):
             content_str = json.dumps(content, ensure_ascii=False, indent=2)
-        elif isinstance(content, str):
-            content_str = content
         else:
             content_str = str(content)
 
         msg_type = getattr(msg, "type", "unknown")
         extra_info = ""
         if hasattr(msg, "tool_calls") and msg.tool_calls:
-            tool_names = [tc.get("name", "?") for tc in msg.tool_calls]
-            extra_info += f" [工具调用: {', '.join(tool_names)}]"
+            extra_info += (
+                f" [工具调用: {', '.join(tc.get('name','?') for tc in msg.tool_calls)}]"
+            )
         if hasattr(msg, "name") and msg.name:
             extra_info += f" [工具名: {msg.name}]"
 
@@ -70,94 +76,196 @@ async def _show_messages(messages, start_label: int = 1):
     print(f"(共 {len(messages)} 条消息)")
 
 
+async def _confirm(prompt_text: str) -> bool:
+    return await prompt_ui.select(prompt_text, [("确认", "y"), ("取消", "n")]) == "y"
+
+
+# ─────────────────────────────────────────────────────────────
+# 查看记忆
+# ─────────────────────────────────────────────────────────────
+
+
 async def view_memory(checkpointer: AsyncRedisSaver, thread_id: str):
     checkpoints = await _collect_checkpoints(checkpointer, thread_id)
     if not checkpoints:
         print(f"\n[!] 线程 '{thread_id}' 没有找到任何记忆。")
         return
 
-    # 从最新往前找，找到第一个包含消息的检查点
     messages = []
-    for cp in reversed(checkpoints):
+    for cp in checkpoints:
         msgs = _get_messages_from_checkpoint(cp.checkpoint)
         if msgs:
             messages = msgs
             break
 
-    total_messages = len(messages)
-    print(f"\n=== 线程 '{thread_id}' 的记忆 ===")
-    print(f"总检查点(状态快照)数量: {len(checkpoints)}")
-    print(f"最近有效检查点中的消息总数: {total_messages}")
+    total = len(messages)
+    print(f"\n=== 线程 '{thread_id}' ===")
+    print(f"检查点数量: {len(checkpoints)}  |  最新有效检查点消息数: {total}")
 
     while True:
-        print(f"\n--- 查看选项 ---")
-        print("1. 查看全部消息 (完整不截断)")
-        print("2. 查看最后 N 条消息")
-        print("3. 查看前 N 条消息")
-        print("4. 查看指定范围 (第 X 到第 Y 条)")
-        print("5. 选择一个检查点查看其消息")
-        print("0. 返回上一级")
+        choice = await prompt_ui.select(
+            "查看方式：",
+            [
+                (f"查看全部消息 ({total} 条)", "1"),
+                ("查看最后 N 条", "2"),
+                ("查看前 N 条", "3"),
+                ("查看指定范围 (第 X~Y 条)", "4"),
+                ("选择某个检查点查看", "5"),
+                ("返回", "q"),
+            ],
+        )
 
-        choice = input("\n请选择 (0-5): ").strip()
-
-        if choice == "0":
+        if choice == "q":
             break
+
         elif choice == "1":
-            if total_messages == 0:
+            if total == 0:
                 print("所有检查点中都没有消息。")
             else:
-                await _show_messages(messages, start_label=1)
+                await _show_messages(messages)
+
         elif choice == "2":
             try:
-                n = int(input(f"显示最后几条? (1-{total_messages}): ").strip())
-                if 1 <= n <= total_messages:
-                    await _show_messages(messages[-n:], start_label=total_messages - n + 1)
+                n = int(input(f"显示最后几条 (1-{total}): ").strip())
+                if 1 <= n <= total:
+                    await _show_messages(messages[-n:], start_label=total - n + 1)
                 else:
-                    print(f"请输入 1 到 {total_messages} 之间的数字。")
+                    print(f"请输入 1~{total} 之间的数字。")
             except ValueError:
                 print("请输入有效数字。")
+
         elif choice == "3":
             try:
-                n = int(input(f"显示前几条? (1-{total_messages}): ").strip())
-                if 1 <= n <= total_messages:
-                    await _show_messages(messages[:n], start_label=1)
+                n = int(input(f"显示前几条 (1-{total}): ").strip())
+                if 1 <= n <= total:
+                    await _show_messages(messages[:n])
                 else:
-                    print(f"请输入 1 到 {total_messages} 之间的数字。")
+                    print(f"请输入 1~{total} 之间的数字。")
             except ValueError:
                 print("请输入有效数字。")
+
         elif choice == "4":
             try:
-                x = int(input(f"起始索引 (1-{total_messages}): ").strip())
-                y = int(input(f"结束索引 ({x}-{total_messages}): ").strip())
-                if 1 <= x <= y <= total_messages:
+                x = int(input(f"起始 (1-{total}): ").strip())
+                y = int(input(f"结束 ({x}-{total}): ").strip())
+                if 1 <= x <= y <= total:
                     await _show_messages(messages[x - 1 : y], start_label=x)
                 else:
-                    print(f"请确保 1 <= 起始 <= 结束 <= {total_messages}。")
+                    print(f"请确保 1 ≤ 起始 ≤ 结束 ≤ {total}。")
             except ValueError:
                 print("请输入有效数字。")
-        elif choice == "5":
-            print(f"\n--- 可用检查点 (共 {len(checkpoints)}) ---")
-            for idx, cp in enumerate(checkpoints):
-                cp_id = cp.config.get("configurable", {}).get("checkpoint_id", f"cp_{idx}")
-                short_id = cp_id[:16] if isinstance(cp_id, str) else str(cp_id)[:16]
-                cp_messages = _get_messages_from_checkpoint(cp.checkpoint)
-                print(f"  {idx}. checkpoint_id={short_id}...  消息数={len(cp_messages)}")
 
+        elif choice == "5":
+            cp_choices = []
+            for idx, cp in enumerate(checkpoints):
+                cp_id = cp.config.get("configurable", {}).get(
+                    "checkpoint_id", f"cp_{idx}"
+                )
+                short_id = str(cp_id)[:16]
+                n_msgs = len(_get_messages_from_checkpoint(cp.checkpoint))
+                cp_choices.append((f"[{idx}] {short_id}…  消息数={n_msgs}", str(idx)))
+            cp_choices.append(("取消", "q"))
+
+            sel = await prompt_ui.select("选择检查点：", cp_choices)
+            if sel == "q":
+                continue
+            cp = checkpoints[int(sel)]
+            cp_messages = _get_messages_from_checkpoint(cp.checkpoint)
+            cp_id = cp.config.get("configurable", {}).get("checkpoint_id", "?")
+            print(f"\n=== 检查点 {cp_id} (索引 {sel}) ===")
+            await _show_messages(cp_messages)
+
+
+# ─────────────────────────────────────────────────────────────
+# 删除检查点
+# ─────────────────────────────────────────────────────────────
+
+
+async def delete_checkpoints(checkpointer: AsyncRedisSaver, thread_id: str):
+    checkpoints = await _collect_checkpoints(checkpointer, thread_id)
+    if not checkpoints:
+        print(f"\n[!] 线程 '{thread_id}' 没有找到任何检查点。")
+        return
+
+    while True:
+        choice = await prompt_ui.select(
+            f"删除检查点 (共 {len(checkpoints)} 个)：",
+            [
+                ("选择删除指定检查点", "1"),
+                ("仅保留最近 N 个（删除其余）", "2"),
+                ("删除全部", "3"),
+                ("返回", "q"),
+            ],
+        )
+
+        if choice == "q":
+            break
+
+        elif choice == "1":
+            cp_choices = []
+            for idx, cp in enumerate(checkpoints):
+                cp_id = cp.config.get("configurable", {}).get(
+                    "checkpoint_id", f"cp_{idx}"
+                )
+                short_id = str(cp_id)[:16]
+                n_msgs = len(_get_messages_from_checkpoint(cp.checkpoint))
+                cp_choices.append((f"[{idx}] {short_id}…  消息数={n_msgs}", str(idx)))
+            cp_choices.append(("取消", "q"))
+
+            sel = await prompt_ui.select("选择要删除的检查点：", cp_choices)
+            if sel == "q":
+                continue
+
+            target = checkpoints[int(sel)]
+            if await _confirm(f"确认删除检查点 [{sel}]？"):
+                deleted = await _delete_checkpoint_list([target])
+                print(f"[OK] 已删除 1 个检查点（清理 {deleted} 个 Redis 键）。")
+                checkpoints = await _collect_checkpoints(checkpointer, thread_id)
+
+        elif choice == "2":
+            max_keep = len(checkpoints) - 1
+            if max_keep < 1:
+                print("检查点数量不足，无需操作。")
+                continue
             try:
-                cp_idx = int(input(f"\n选择检查点索引 (0-{len(checkpoints)-1}): ").strip())
-                if 0 <= cp_idx < len(checkpoints):
-                    cp = checkpoints[cp_idx]
-                    cp_messages = _get_messages_from_checkpoint(cp.checkpoint)
-                    cp_id = cp.config.get("configurable", {}).get("checkpoint_id", "?")
-                    print(f"\n=== 检查点 {cp_id} (索引 {cp_idx}) ===")
-                    print(f"消息数: {len(cp_messages)}")
-                    await _show_messages(cp_messages, start_label=1)
-                else:
-                    print(f"请输入 0 到 {len(checkpoints)-1} 之间的数字。")
+                raw_n = input(f"保留最近几个 (1-{max_keep}，q 取消): ").strip()
+                if raw_n.lower() == "q":
+                    continue
+                n = int(raw_n)
+                if not 1 <= n <= max_keep:
+                    print(f"请输入 1~{max_keep} 之间的数字。")
+                    continue
+                targets = checkpoints[n:]
+                if await _confirm(
+                    f"将删除 {len(targets)} 个旧检查点，保留最近 {n} 个，确认？"
+                ):
+                    deleted = await _delete_checkpoint_list(targets)
+                    print(
+                        f"[OK] 已删除 {len(targets)} 个旧检查点（清理 {deleted} 个 Redis 键）。"
+                    )
+                    checkpoints = await _collect_checkpoints(checkpointer, thread_id)
             except ValueError:
                 print("请输入有效数字。")
-        else:
-            print("无效选项。")
+
+        elif choice == "3":
+            if await _confirm(f"确定删除 '{thread_id}' 的全部检查点？"):
+                await delete_memory(checkpointer, thread_id)
+                break
+
+
+async def _delete_checkpoint_list(checkpoints: list) -> int:
+    r = redis.from_url(DB_URI)
+    total = 0
+    for cp in checkpoints:
+        cp_id = cp.config.get("configurable", {}).get("checkpoint_id", "")
+        if not cp_id:
+            continue
+        keys = await r.keys(f"*{cp_id}*")
+        if keys:
+            await r.delete(*keys)
+            total += len(keys)
+    await r.aclose()
+    return total
 
 
 async def delete_memory(checkpointer: AsyncRedisSaver, thread_id: str):
@@ -167,10 +275,8 @@ async def delete_memory(checkpointer: AsyncRedisSaver, thread_id: str):
             await checkpointer.adelete_thread(thread_id)
             deleted_via_api = True
         elif hasattr(checkpointer, "delete_thread"):
-            if asyncio.iscoroutinefunction(checkpointer.delete_thread):
-                await checkpointer.delete_thread(thread_id)
-            else:
-                checkpointer.delete_thread(thread_id)
+            fn = checkpointer.delete_thread
+            await fn(thread_id) if asyncio.iscoroutinefunction(fn) else fn(thread_id)
             deleted_via_api = True
     except NotImplementedError:
         pass
@@ -182,47 +288,119 @@ async def delete_memory(checkpointer: AsyncRedisSaver, thread_id: str):
         keys = await r.keys(f"*{thread_id}*")
         if keys:
             await r.delete(*keys)
-            print(f"\n[OK] 成功清理 Redis 中与线程 '{thread_id}' 相关的 {len(keys)} 个底层键。")
+            print(f"\n[OK] 已清理 Redis 中 '{thread_id}' 相关的 {len(keys)} 个键。")
         elif deleted_via_api:
-            print(f"\n[OK] 成功通过 API 删除线程 '{thread_id}' 的记忆。")
+            print(f"\n[OK] 已通过 API 删除线程 '{thread_id}'。")
         else:
-            print(f"\n[!] 没有在 Redis 中找到 '{thread_id}' 相关的记忆数据。")
+            print(f"\n[!] 未找到 '{thread_id}' 相关数据。")
         await r.aclose()
     except Exception as e:
-        print(f"\n[Error] 手动清理 Redis Keys 失败: {e}")
+        print(f"\n[Error] 手动清理 Redis 键失败: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# 长期记忆管理
+# ─────────────────────────────────────────────────────────────
+
+
+async def manage_long_term_memories(ltm: LongTermMemory):
+    while True:
+        memories = await ltm.load_all()
+
+        choice = await prompt_ui.select(
+            f"长期记忆管理 (共 {len(memories)} 条)：",
+            [
+                ("查看全部记忆", "1"),
+                ("删除指定记忆", "2"),
+                ("清空全部", "3"),
+                ("返回", "q"),
+            ],
+        )
+
+        if choice == "q":
+            break
+
+        elif choice == "1":
+            if not memories:
+                print("暂无长期记忆。")
+                continue
+            by_type = {}
+            for m in memories:
+                by_type.setdefault(m["type"], []).append(m)
+            for t in MEMORY_TYPES:
+                if t not in by_type:
+                    continue
+                print(f"\n【{_TYPE_LABELS[t]}】")
+                for m in by_type[t]:
+                    print(f"  ID={m['id']}  name={m['name']}")
+                    print(f"  描述: {m['description']}")
+                    print(f"  内容: {m['content']}")
+                    print(f"  创建: {m['created_at']}")
+                    print()
+
+        elif choice == "2":
+            if not memories:
+                print("暂无记忆可删除。")
+                continue
+            mem_choices = [
+                (f"[{m['type']}] {m['name']} — {m['description']}", str(i))
+                for i, m in enumerate(memories)
+            ]
+            mem_choices.append(("取消", "q"))
+            sel = await prompt_ui.select("选择要删除的记忆：", mem_choices)
+            if sel == "q":
+                continue
+            m = memories[int(sel)]
+            if await _confirm(f"确认删除 '{m['name']}'？"):
+                await ltm.delete(m["id"])
+                print(f"[OK] 已删除: {m['name']}")
+
+        elif choice == "3":
+            if await _confirm("确认清空全部长期记忆？"):
+                await ltm.delete_all()
+                print("[OK] 已清空全部长期记忆。")
+
+
+# ─────────────────────────────────────────────────────────────
+# 主入口
+# ─────────────────────────────────────────────────────────────
 
 
 async def main():
-    async with AsyncRedisSaver.from_conn_string(DB_URI) as checkpointer:
+    async with AsyncRedisSaver.from_conn_string(DB_URI) as checkpointer, LongTermMemory(
+        DB_URI
+    ) as ltm:
         while True:
-            print("\n================ 记忆管理器 ================")
-            for key, (name, tid) in THREADS.items():
-                print(f"{key}. {name} (ID: {tid})")
-            print("q. 退出")
-            print("============================================")
+            top_choices = [
+                (f"{name}  (ID: {tid})", key) for key, (name, tid) in THREADS.items()
+            ]
+            top_choices += [("长期记忆管理", "5"), ("退出", "q")]
 
-            choice = input("请选择要操作的 Agent (1-4) 或输入 q 退出: ").strip().lower()
+            choice = await prompt_ui.select("记忆管理器 — 请选择：", top_choices)
+
             if choice == "q":
                 break
 
-            if choice not in THREADS:
-                print("无效的选项，请重新输入。")
+            if choice == "5":
+                await manage_long_term_memories(ltm)
                 continue
 
             name, tid = THREADS[choice]
-            print(f"\n当前选中: {name}")
-            print("1. 查看记忆")
-            print("2. 删除记忆")
+            action = await prompt_ui.select(
+                f"{name}：",
+                [
+                    ("查看记忆", "1"),
+                    ("删除记忆", "2"),
+                    ("返回", "q"),
+                ],
+            )
 
-            action = input("请选择操作 (1/2): ").strip()
-            if action == "1":
+            if action == "q":
+                continue
+            elif action == "1":
                 await view_memory(checkpointer, tid)
             elif action == "2":
-                confirm = input(f"确定要删除 {name} 的所有记忆吗？(y/n): ").strip().lower()
-                if confirm == "y":
-                    await delete_memory(checkpointer, tid)
-            else:
-                print("无效的操作。")
+                await delete_checkpoints(checkpointer, tid)
 
 
 if __name__ == "__main__":
