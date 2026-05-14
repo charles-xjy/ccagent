@@ -1,18 +1,22 @@
 import asyncio
 import re
 import sys
+import os
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# 直接运行时确保父包可寻址
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 import redis.asyncio as redis
-from long_term_memory import LongTermMemory, MEMORY_TYPES, _TYPE_LABELS
+from memory.long_term_memory import LongTermMemory, MEMORY_TYPES, _TYPE_LABELS
 from core import prompt_ui
 
 DB_URI = "redis://10.129.107.145:6379"
 
-# session_YYYYMMDD_HHMM 格式的会话 ID
-_SESSION_RE = re.compile(r'session_\d{8}_\d{4}')
+# session_<项目名> 格式，提取 base session ID（去除 _coder/_tech-researcher/_reviewer 后缀）
+_ROLE_SUFFIX_RE = re.compile(r'(_coder|_tech-researcher|_reviewer)$')
+_SESSION_RE = re.compile(r'(session_[^:]+)')
 
 # 旧格式 thread ID 前缀
 _LEGACY_BASE = "manager_executor_v2"
@@ -34,17 +38,17 @@ _ROLE_SUFFIXES = [
 async def _scan_sessions(r) -> tuple:
     """
     扫描 Redis，返回 (base_sessions, legacy_ids)：
-      base_sessions — session_YYYYMMDD_HHMM 基础 ID 列表，倒序（最新在前）
+      base_sessions — session_<项目名>_YYYYMMDD_HHMM 基础 ID 列表，倒序（最新在前）
       legacy_ids    — 旧格式 thread ID 列表（仅返回 Redis 中实际存在的）
     """
     all_keys = await r.keys("*")
 
-    # 新格式
+    # 新格式：提取 session id，剥离 agent 角色后缀得到 base ID
     base_ids = set()
     for k in all_keys:
         m = _SESSION_RE.search(k)
         if m:
-            base_ids.add(m.group())
+            base_ids.add(_ROLE_SUFFIX_RE.sub("", m.group(1)))
 
     # 旧格式：检查 Redis 里是否真的有对应 key
     legacy = [tid for tid in _LEGACY_THREAD_IDS

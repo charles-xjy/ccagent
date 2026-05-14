@@ -6,7 +6,7 @@ from core.state import AgentState
 from core.tools import read_file
 from core.confirm import create_tool_confirm_node, make_agent_router, route_after_tool_confirm
 from reviewer_agent.tools import run_in_sandbox, run_python_test, run_bash_command, check_code_style
-from compressor import create_compression_node, create_warn_node, make_token_router, route_after_warn
+from memory import create_compression_node, create_warn_node, make_token_router, route_after_warn
 
 _DANGEROUS = {"run_in_sandbox", "run_python_test"}
 

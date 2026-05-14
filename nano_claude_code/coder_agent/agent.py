@@ -6,7 +6,7 @@ from core.state import AgentState
 from core.tools import read_file
 from core.confirm import create_tool_confirm_node, make_agent_router, route_after_tool_confirm
 from coder_agent.tools import bash, write_file, edit_file
-from compressor import create_compression_node, create_warn_node, make_token_router, route_after_warn
+from memory import create_compression_node, create_warn_node, make_token_router, route_after_warn
 
 _DANGEROUS = {"write_file", "edit_file"}
 

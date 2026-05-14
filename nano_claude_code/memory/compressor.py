@@ -11,19 +11,24 @@ Token 用量路由：
   Phase 1: 优先删除旧 ToolMessage（工具输出体积大、价值低）
   Phase 2: 若仍超阈值，调用 LLM 生成 8 段式摘要替换旧消息
 """
+
 import json
 from datetime import datetime
 from typing import List
 
 from langchain_core.messages import (
-    AIMessage, BaseMessage, HumanMessage,
-    RemoveMessage, SystemMessage, ToolMessage,
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
 )
 from langgraph.types import interrupt
 
 # ── 压缩触发参数 ──────────────────────────────────────────────
-KEEP_RECENT = 3         # 无论如何保留最近 N 条消息原文
-MAX_TOKENS = 163840     # Qwen3.5-27B，vLLM --max-model-len 163840
+KEEP_RECENT = 3  # 无论如何保留最近 N 条消息原文
+MAX_TOKENS = 163840  # Qwen3.5-27B，vLLM --max-model-len 163840
 TOKEN_THRESHOLD = 0.92  # 使用率超过此比例自动压缩
 
 # ── 8 段式压缩 Prompt（源自 Claude Code 设计）──────────────────
@@ -46,6 +51,7 @@ COMPRESSION_PROMPT = """你的任务是将以下 AI Agent 对话历史压缩为�
 
 
 # ── Token 估算 ────────────────────────────────────────────────
+
 
 def estimate_tokens(messages: List[BaseMessage]) -> int:
     total = 0
@@ -82,6 +88,7 @@ def needs_compression(
 
 # ── 工厂函数 ──────────────────────────────────────────────────
 
+
 def create_compression_node(model):
     """返回绑定了 model 的异步压缩节点函数。"""
 
@@ -95,15 +102,23 @@ def create_compression_node(model):
         old_msgs = messages[:boundary]
         recent = messages[boundary:]
 
-        # ── Phase 1: 尝试只删除旧 ToolMessage ──────────────────
-        old_tool_indices = [i for i, m in enumerate(old_msgs) if isinstance(m, ToolMessage)]
-        if old_tool_indices:
-            pruned = [m for i, m in enumerate(messages) if i not in set(old_tool_indices)]
-            if not needs_compression(pruned):
-                to_remove = [old_msgs[i] for i in old_tool_indices]
-                removes = [RemoveMessage(id=m.id) for m in to_remove if hasattr(m, "id")]
-                print(f"\033[33m[压缩-P1] 清理 {len(removes)} 条旧 ToolMessage\033[0m")
-                return {"messages": removes}
+        # ── Phase 1: 尝试只删除旧 ToolMessage（用户手动选压缩时跳过）──
+        user_requested = state.get("compress_choice") == "compress"
+        if not user_requested:
+            old_tool_indices = [
+                i for i, m in enumerate(old_msgs) if isinstance(m, ToolMessage)
+            ]
+            if old_tool_indices:
+                pruned = [
+                    m for i, m in enumerate(messages) if i not in set(old_tool_indices)
+                ]
+                if not needs_compression(pruned):
+                    to_remove = [old_msgs[i] for i in old_tool_indices]
+                    removes = [
+                        RemoveMessage(id=m.id) for m in to_remove if hasattr(m, "id")
+                    ]
+                    print(f"\033[33m[压缩-P1] 清理 {len(removes)} 条旧 ToolMessage\033[0m")
+                    return {"messages": removes}
 
         # ── Phase 2: 生成摘要替换旧消息 ────────────────────────
         # 若 recent[0] 是悬空 ToolMessage，纳入压缩范围
@@ -121,11 +136,13 @@ def create_compression_node(model):
 
         try:
             tokens_before = get_token_usage(messages)
-            resp = await model.ainvoke([
-                SystemMessage(content=COMPRESSION_PROMPT),
-                HumanMessage(content="\n".join(lines)),
-            ])
-            summary_msg = AIMessage(
+            resp = await model.ainvoke(
+                [
+                    SystemMessage(content=COMPRESSION_PROMPT),
+                    HumanMessage(content="\n".join(lines)),
+                ]
+            )
+            summary_msg = HumanMessage(
                 content=(
                     f"📋 **对话摘要** (压缩于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，"
                     f"原 {len(old_msgs)} 条 → 摘要 1 条)\n\n{resp.content}"
@@ -140,7 +157,7 @@ def create_compression_node(model):
             # 删除所有旧消息，按 [summary, recent...] 顺序重建
             # add_messages 处理顺序：先执行 Remove，再追加新消息
             removes = [RemoveMessage(id=m.id) for m in messages if hasattr(m, "id")]
-            return {"messages": removes + [summary_msg] + list(recent)}
+            return {"messages": removes + [summary_msg] + list(recent), "compress_choice": ""}
 
         except Exception as e:
             print(f"\033[31m[压缩] 生成摘要失败: {e}，跳过\033[0m")
@@ -151,6 +168,7 @@ def create_compression_node(model):
 
 def create_warn_node():
     """返回 warn 节点：用 interrupt() 暂停图，等待用户选择是否压缩。"""
+
     async def warn_node(state: dict) -> dict:
         messages = state.get("messages", [])
         current = get_token_usage(messages)
@@ -162,6 +180,7 @@ def create_warn_node():
             "是否立即压缩上下文？输入 compress 压缩，直接回车跳过"
         )
         return {"compress_choice": str(choice).strip().lower()}
+
     return warn_node
 
 
@@ -177,6 +196,7 @@ def make_token_router(
     warn_low: float = 0.50,
 ):
     """返回路由函数：根据 token 用量决定下一步节点。"""
+
     def token_router(state: dict) -> str:
         messages = state.get("messages", [])
         if len(messages) < KEEP_RECENT + 2:
@@ -186,7 +206,8 @@ def make_token_router(
         ratio = current / available
         if ratio >= threshold:
             return "compress"
-        if ratio >= warn_low:   # 50% ~ 85% 均走 warn
+        if ratio >= warn_low:  # 50% ~ 85% 均走 warn
             return "warn"
         return "agent"
+
     return token_router
