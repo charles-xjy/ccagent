@@ -72,11 +72,12 @@ Manager 通过 `task_tool` 虚拟工具向专家发出指令，条件边在运�
 
 | Agent | 职责 | 工具 |
 |-------|------|------|
+| **Intent-Analyst** | 需求确认问答、生成结构化需求文档 | 无（纯 LLM 对话 + `interrupt()` 交互） |
 | **Coder** | 编写、修改代码文件 | `read_file`、`write_file`、`edit_file`、`bash`（只读） |
 | **Tech-Researcher** | 技术调研，查文档、搜索 | `web_search`、`langchain_docs`、`GitHub` 系列、`fetch`、`read_file` |
 | **Reviewer** | 代码审查、测试运行 | `read_file`、`run_in_sandbox`、`run_python_test`、`check_code_style`、`run_bash_command` |
 
-每个子 Agent 都是独立的 LangGraph 子图，拥有**独立的 Redis checkpoint**，互不干扰。
+Coder、Tech-Researcher、Reviewer 三个子 Agent 各是独立的 LangGraph 子图，拥有**独立的 Redis checkpoint**，互不干扰。Intent-Analyst 是 Manager 主图中的内联节点，与 Manager 共享同一 thread_id，不单独占用 checkpoint。
 
 ---
 
