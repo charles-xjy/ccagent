@@ -19,7 +19,8 @@ from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.types import Command, interrupt
 
 from core.state import AgentState
-from core.config import get_model
+from core.config import get_model, REDIS_URI, REDIS_TTL
+from core.memory_store import MemoryStore
 from core.tools import WORKDIR
 from coder_agent.agent import create_coder_agent
 from researcher_agent.agent import create_researcher_agent
@@ -248,16 +249,89 @@ async def _scan_base_sessions(db_uri: str) -> list[str]:
         await r.aclose()
 
 
+async def _scan_mysql_sessions(memory_store) -> list[str]:
+    """从 MySQL 扫描所有归档的会话 ID，倒序返回。"""
+    try:
+        threads = await memory_store.list_threads()
+        return sorted([t["thread_id"] for t in threads], reverse=True)
+    except Exception:
+        return []
+
+
+async def _restore_from_mysql(thread_id: str, memory_store: MemoryStore, app, session_config: dict) -> bool:
+    """从 MySQL 加载历史消息注入 State，重建 Redis checkpoint。
+
+    Returns: True 表示成功从 MySQL 恢复了历史上下文。
+    """
+    messages = await memory_store.load(thread_id)
+    if not messages:
+        return False
+    print(f"\033[33m[记忆] 从 MySQL 恢复了 {len(messages)} 条历史消息，重建 Redis checkpoint。\033[0m")
+    # 用一条空消息触发 LangGraph checkpoint 建立
+    initial_state = {"messages": list(messages)}
+    try:
+        await app.aupdate_state(session_config, initial_state)
+    except Exception:
+        # aupdate_state 可能不可用，回退到 stream 方式
+        async for _ in app.astream(
+            {"messages": []}, session_config, stream_mode="updates"
+        ):
+            pass
+    return True
+
+
+async def _archive_to_mysql(thread_id: str, checkpointer, memory_store: MemoryStore) -> None:
+    """将 Redis checkpoint 中的消息归档到 MySQL。"""
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        snapshot = await checkpointer.aget(config)
+    except Exception as e:
+        print(f"\033[33m[记忆] 读取 Redis checkpoint 失败: {e}\033[0m")
+        return
+
+    if snapshot is None:
+        return
+
+    channel_values = getattr(snapshot, "channel_values", {})
+    if isinstance(channel_values, dict):
+        messages = channel_values.get("messages", [])
+    else:
+        messages = getattr(channel_values, "messages", [])
+
+    if not messages:
+        return
+
+    try:
+        await memory_store.archive(thread_id, messages)
+        print(f"\033[32m[记忆] 已将会话 {thread_id} 的 {len(messages)} 条消息归档到 MySQL。\033[0m")
+    except Exception as e:
+        print(f"\033[31m[记忆] 归档到 MySQL 失败: {e}\033[0m")
+
+
 async def main():
     print("\033[34m[*] 系统正在启动...\033[0m")
     model = get_model()
 
-    DB_URI = "redis://10.129.107.145:6379"
-    import os; os.environ.setdefault("REDIS_URL", DB_URI)  # redisvl 后台任务需要
-    async with AsyncRedisSaver.from_conn_string(DB_URI) as checkpointer, LongTermMemory(
-        DB_URI
-    ) as ltm:
-        cached_memories = await ltm.load_all()
+    import os; os.environ.setdefault("REDIS_URL", REDIS_URI)  # redisvl 后台任务需要
+
+    # 初始化 MySQL MemoryStore（可选，失败则降级为 Redis-only）
+    memory_store = None
+    try:
+        from core.config import MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
+        memory_store = await MemoryStore.create(
+            host=MYSQL_HOST, port=MYSQL_PORT,
+            user=MYSQL_USER, password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE,
+        )
+        print("\033[32m[OK] MySQL 记忆存储已连接。\033[0m")
+    except Exception as e:
+        print(f"\033[33m[!] MySQL 不可用 ({e})，将仅使用 Redis 记忆。\033[0m")
+
+    try:
+        async with AsyncRedisSaver.from_conn_string(REDIS_URI, ttl=REDIS_TTL) as checkpointer, LongTermMemory(
+            REDIS_URI
+        ) as ltm:
+            cached_memories = await ltm.load_all()
         if cached_memories:
             print(f"[*] 已加载 {len(cached_memories)} 条长期记忆。")
 
@@ -271,8 +345,20 @@ async def main():
                 "\033[33m[!] 所有 MCP 服务器均不可用，research agent 将仅使用 read_file\033[0m"
             )
 
-        existing = await _scan_base_sessions(DB_URI)
+        existing = await _scan_base_sessions(REDIS_URI)
         choices = [(f"▶  恢复: {sid}", f"resume:{sid}") for sid in existing]
+
+        # 扫描 MySQL 归档会话，把 Redis 中已不存在的加进来
+        mysql_sessions = []
+        _restored_from_mysql = False
+        if memory_store is not None:
+            mysql_ids = await _scan_mysql_sessions(memory_store)
+            mysql_sessions = [mid for mid in mysql_ids if mid not in existing]
+            for mid in mysql_sessions:
+                info = await memory_store.load(mid)
+                msg_count = len(info) if info else 0
+                choices.append((f"🗄  从 MySQL 恢复: {mid} ({msg_count}条消息)", f"mysql:{mid}"))
+
         choices.append(("✨  新建会话", "__new__"))
         pick = await prompt_ui.select("请选择会话：", choices)
 
@@ -280,6 +366,11 @@ async def main():
             session_id = pick[len("resume:"):]
             project_name = re.sub(r'_\d{8}_\d{4}$', '', session_id[len("session_"):])
             print(f"\033[32m[OK] 恢复会话: {session_id}\033[0m")
+        elif pick.startswith("mysql:"):
+            session_id = pick[len("mysql:"):]
+            project_name = re.sub(r'_\d{8}_\d{4}$', '', session_id[len("session_"):])
+            print(f"\033[32m[OK] 从 MySQL 恢复会话: {session_id}\033[0m")
+            _restored_from_mysql = True
         else:
             print("\n请输入项目名称（如：天气agent、search_tool，直接回车则仅用时间）:")
             project_name = input(" >> ").strip()
@@ -555,9 +646,13 @@ async def main():
         print("\033[32m[OK] Nano Claude Code (Manager/Executor 架构) 已就绪。\033[0m")
         session_config = {"configurable": {"thread_id": session_id}}
 
+        # ── MySQL 恢复：将归档消息注入 State，重建 Redis checkpoint ──────
+        if _restored_from_mysql and memory_store is not None:
+            await _restore_from_mysql(session_id, memory_store, app, session_config)
+
         # ── 恢复会话时检测未完成任务，询问是否自动继续 ────────────────────
         _auto_input = None
-        if pick.startswith("resume:"):
+        if pick.startswith("resume:") or _restored_from_mysql:
             try:
                 snap = await app.aget_state(session_config)
                 saved_todo: list = []
@@ -661,9 +756,22 @@ async def main():
         except Exception as e:
             print(f"[!] 记忆提炼过程出错: {e}")
 
+        # ── 归档完整对话到 MySQL ────────────────────────────────────────
+        if memory_store is not None:
+            print("\n[*] 正在归档会话到 MySQL...")
+            await _archive_to_mysql(session_id, checkpointer, memory_store)
+
+    finally:
+        if memory_store is not None:
+            await memory_store.close()
+            print("\033[32m[OK] MySQL 连接已关闭。\033[0m")
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        pass
+    finally:
+        # 确保 MemoryStore 被关闭（asyncio.run 内部异常时也能清理）
         pass

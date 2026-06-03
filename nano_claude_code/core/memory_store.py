@@ -120,3 +120,9 @@ class MemoryStore:
         self.pool.close()
         await self.pool.wait_closed()
         logger.info("MemoryStore closed")
+
+    async def __aenter__(self) -> "MemoryStore":
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        await self.close()

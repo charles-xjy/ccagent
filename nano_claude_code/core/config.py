@@ -7,3 +7,15 @@ def get_model():
         model="Qwen_agent",
         model_provider="openai",
     )
+
+
+# Redis — hot storage for active LangGraph checkpoints
+REDIS_URI = "redis://10.129.107.145:6379"
+REDIS_TTL = 604800  # 7天不活跃的 checkpoint 自动过期，淘汰后走 MySQL 恢复
+
+# MySQL — cold storage for archived conversation history
+MYSQL_HOST = "10.129.107.145"
+MYSQL_PORT = 3306
+MYSQL_USER = "ccagent"
+MYSQL_PASSWORD = "ccagent123"
+MYSQL_DATABASE = "ccagent"

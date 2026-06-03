@@ -1,6 +1,6 @@
 # Nano Claude Code
 
-一个基于 **LangGraph** 实现的轻量级 AI 编程助手，采用 Manager/Executor 多智能体架构，具备完整的三层记忆系统、人机交互确认机制和上下文自动压缩能力。
+一个基于 **LangGraph** 实现的轻量级 AI 编程助手，采用 Manager/Executor 多智能体架构，具备完整的三层记忆系统（Redis 热缓存 + 语义记忆提炼 + MySQL 冷归档）、人机交互确认机制和上下文自动压缩能力。
 
 ---
 
@@ -37,6 +37,7 @@ Nano Claude Code 是对 Anthropic Claude Code 核心机制的轻量复现与创�
 - Manager 负责**规划与协调**，不直接写代码
 - 专家子 Agent 各司其职，专注于自己的领域
 - 每次任务结束后自动**提炼长期记忆**，下次会话直接继承
+- 对话退出时**自动归档到 MySQL**，Redis 过期后仍可恢复
 - 上下文接近溢出时**自动压缩**，可连续工作超长任务
 
 ---
@@ -100,17 +101,32 @@ Coder、Tech-Researcher、Reviewer 三个子 Agent 各是独立的 LangGraph 子
 仿照 Claude Code 的记忆架构，三层分工明确：
 
 ```
-短期记忆（Session Memory）
-  └── LangGraph Checkpoint → Redis
-      每次节点执行后自动快照，保持当前会话连贯性
+第一层：热缓存 (Redis Checkpoint)
+  └── LangGraph AsyncRedisSaver → Redis (TTL 7天)
+      每次节点执行后自动快照完整 AgentState
+      7天内回访直接毫秒级恢复，无需查询 MySQL
 
-上下文压缩（Context Compression）
-  └── 两阶段 LLM 摘要，替换旧消息
-      防止 context window 溢出，保持执行效率
-
-长期记忆（Long-Term Memory）
+第二层：语义记忆 (LongTermMemory)
   └── Redis (ltm:mem:* 键空间)
       从对话中提炼结构化知识，跨会话注入背景信息
+      四种类型: user / feedback / project / reference
+
+第三层：冷归档 (MySQL)
+  └── MemoryStore → MySQL conversations 表
+      对话退出时自动归档完整消息历史
+      Redis checkpoint 过期后，从这里恢复对话上下文
+      恢复后自动重建 Redis checkpoint，TTL 重新计时
+```
+
+**数据流**：
+
+```
+对话中:   LLM → State → AsyncRedisSaver → Redis (每步快照)
+退出时:   Redis checkpoint → 语义提炼 → Redis ltm:mem:*
+          Redis checkpoint → 消息序列化 → MySQL UPSERT
+          Redis checkpoint 保留不删 (7天 TTL 自然淘汰)
+再进入:   先查 Redis → 命中 → LangGraph 自动恢复 (热路径)
+                    → 未命中 → MySQL loads() → 注入 State → 重建 Redis (冷路径)
 ```
 
 **长期记忆** 支持 4 种类型，完整映射用户画像：
@@ -164,11 +180,12 @@ token 用量检测
 
 ### 5. 会话管理与恢复
 
-启动时列出所有历史会话（从 Redis 动态扫描），支持：
+启动时列出所有历史会话（从 Redis 动态扫描 + MySQL 归档），支持：
 
-- **恢复旧会话**：自动检测未完成任务（`pending` / `in_progress` 状态），提示用户选择是否自动继续
-- **新建会话**：输入项目名称，生成带时间戳的唯一 session ID
-- **会话隔离**：Manager 与每个子 Agent 使用独立 thread_id，互不污染
+- **恢复 Redis 会话**：自动检测未完成任务（`pending` / `in_progress` 状态），提示用户选择是否自动继续。LangGraph 从 checkpoint 自动恢复完整 State。
+- **从 MySQL 恢复**：Redis checkpoint 过期后，自动列出 MySQL 中已归档的会话，选择后从 MySQL 加载完整消息历史，注入 State 并重建 Redis checkpoint（TTL 重新计时 7 天）。
+- **新建会话**：输入项目名称，生成带时间戳的唯一 session ID（格式 `session_{project}_{timestamp}`）。
+- **会话隔离**：Manager 与每个子 Agent 使用独立 thread_id，互不污染。仅主 Manager 会话归档到 MySQL。
 
 ---
 
@@ -291,7 +308,7 @@ Manager 只规划和协调，不写代码；每个子 Agent 专注于自己的�
 
 ### 真正的跨会话记忆
 
-不依赖外部向量数据库，使用 Redis + LLM 提炼实现轻量长期记忆。记忆在 session 结束时自动提炼，在下次会话启动时自动注入，用户无需重复说明项目背景和偏好。
+不依赖外部向量数据库，使用 Redis + MySQL + LLM 提炼实现三层记忆。语义记忆在 session 结束时自动提炼，完整对话历史自动归档到 MySQL。Redis 过期后可从 MySQL 恢复对话上下文，下次会话启动时自动注入，用户无需重复说明项目背景和偏好。
 
 ### 智能的上下文管理
 
@@ -318,8 +335,9 @@ nano_claude_code/
 ├── main.py                    # 主程序：Manager 图构建与交互主循环
 ├── core/
 │   ├── state.py               # AgentState 定义（messages, current_todo 等）
-│   ├── config.py              # 模型初始化（支持 vLLM 兼容端点）
+│   ├── config.py              # 模型/Redis/MySQL 配置
 │   ├── tools.py               # 共用工具：read_file，WORKDIR 定义
+│   ├── memory_store.py        # MySQL 归档存储（archive/load/delete/list）
 │   ├── confirm.py             # 危险工具确认节点工厂函数
 │   └── prompt_ui.py           # 方向键交互 select 组件
 ├── intent_agent/
@@ -339,7 +357,9 @@ nano_claude_code/
 │   ├── memory_manager.py      # 记忆管理 CLI（查看/删除检查点和长期记忆）
 │   └── __init__.py            # 统一导出压缩相关函数
 ├── MEMORY_DESIGN.md           # 记忆系统详细设计文档
-└── README.md                  # 本文件
+├── README.md                  # 本文件
+└── ../docs/
+    └── memory_architecture.md # 三层记忆架构完整文档（含数据流、表结构、维护指南）
 ```
 
 ---
@@ -350,18 +370,21 @@ nano_claude_code/
 
 - Python 3.11+
 - Redis 实例（用于 Checkpoint 和长期记忆）
+- MySQL 8.0（用于对话归档持久化，可选，不可用时自动降级）
 - 兼容 OpenAI API 的 LLM 服务（如 vLLM 部署的 Qwen 模型）
 
 **安装与运行：**
 
 ```bash
 # 安装依赖
-pip install langchain langgraph langchain-core redis python-dotenv
+pip install langchain langgraph langchain-core redis python-dotenv aiomysql
 
-# 配置环境变量（.env 文件）
-# 修改 core/config.py 中的模型端点地址
-# 修改 main.py 中的 DB_URI 为实际 Redis 地址
+# 启动 Redis 和 MySQL（Docker 方式）
+docker run -d --name redis-stack-server -p 6379:6379 redis/redis-stack-server:latest
+docker run -d --name mysql-ccagent --restart always -p 3306:3306 \
+  -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=ccagent mysql:8.0
 
+# 修改 core/config.py 中的 Redis/MySQL 连接地址
 # 启动
 python nano_claude_code/main.py
 ```
@@ -378,9 +401,12 @@ python nano_claude_code/memory/memory_manager.py
 
 | 组件 | 技术选型 |
 |------|----------|
-| Agent 框架 | LangGraph (StateGraph + Checkpoint) |
+| Agent 框架 | LangGraph (StateGraph + Checkpoint + interrupt) |
 | LLM 接入 | LangChain + OpenAI 兼容接口（vLLM） |
-| 记忆持久化 | Redis (AsyncRedisSaver + 自定义 ltm: 键空间) |
+| 热缓存 | Redis (AsyncRedisSaver, TTL 7天, checkpoint 自动快照) |
+| 语义记忆 | Redis (LongTermMemory, ltm:mem:* 键空间, LLM 自动提炼) |
+| 冷归档 | MySQL 8.0 (MemoryStore, aiomysql, 完整消息历史持久化) |
 | 工具扩展 | MCP 协议（Model Context Protocol） |
 | 异步运行时 | Python asyncio（Windows SelectorEventLoop） |
 | 交互界面 | 终端 ANSI 颜色 + 自定义方向键 select 组件 |
+| 容器化 | Docker (Redis Stack Server + MySQL 8.0) |

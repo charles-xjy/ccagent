@@ -11,6 +11,8 @@ from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 import redis.asyncio as redis
 from memory.long_term_memory import LongTermMemory, MEMORY_TYPES, _TYPE_LABELS
 from core import prompt_ui
+from core.config import MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
+from core.memory_store import MemoryStore
 
 DB_URI = "redis://10.129.107.145:6379"
 
@@ -401,92 +403,213 @@ async def manage_long_term_memories(ltm: LongTermMemory):
 
 
 # ─────────────────────────────────────────────────────────────
+# MySQL 归档管理
+# ─────────────────────────────────────────────────────────────
+
+
+async def view_mysql_archives(memory_store: MemoryStore):
+    """查看 MySQL 中归档的完整对话历史。"""
+    while True:
+        threads = await memory_store.list_threads()
+        if not threads:
+            print("\n[!] MySQL 中没有归档的会话。")
+            input("按回车返回...")
+            return
+
+        choices = []
+        for t in threads:
+            label = (
+                f"{t['thread_id']}  —  {t['message_count']} 条消息"
+                f"  ({t['updated_at'].strftime('%Y-%m-%d %H:%M') if hasattr(t['updated_at'], 'strftime') else str(t['updated_at'])})"
+            )
+            choices.append((label, f"view:{t['thread_id']}"))
+        choices += [("删除某个归档", "__delete__"), ("返回", "q")]
+
+        choice = await prompt_ui.select(
+            f"MySQL 归档列表 (共 {len(threads)} 个会话)：",
+            choices,
+        )
+
+        if choice == "q":
+            return
+
+        if choice == "__delete__":
+            del_choices = [
+                (f"{t['thread_id']} ({t['message_count']} 条消息)", f"del:{t['thread_id']}")
+                for t in threads
+            ]
+            del_choices.append(("取消", "q"))
+            sel = await prompt_ui.select("选择要删除的归档：", del_choices)
+            if sel == "q":
+                continue
+            tid = sel[len("del:"):]
+            if await _confirm(f"确认删除归档 '{tid}'？此操作不可恢复。"):
+                await memory_store.delete(tid)
+                print(f"[OK] 已删除归档: {tid}")
+            continue
+
+        # 查看某个归档的完整消息
+        tid = choice[len("view:"):]
+        messages = await memory_store.load(tid)
+        if not messages:
+            print(f"\n[!] 无法加载 '{tid}' 的消息。")
+            continue
+
+        print(f"\n=== MySQL 归档: {tid} ===")
+        print(f"消息总数: {len(messages)}")
+
+        while True:
+            total = len(messages)
+            view_choice = await prompt_ui.select(
+                "查看方式：",
+                [
+                    (f"查看全部消息 ({total} 条)", "1"),
+                    ("查看最后 N 条", "2"),
+                    ("查看前 N 条", "3"),
+                    ("查看指定范围 (第 X~Y 条)", "4"),
+                    ("返回", "q"),
+                ],
+            )
+
+            if view_choice == "q":
+                break
+            elif view_choice == "1":
+                await _show_messages(messages)
+            elif view_choice == "2":
+                try:
+                    n = int(input(f"显示最后几条 (1-{total}): ").strip())
+                    if 1 <= n <= total:
+                        await _show_messages(messages[-n:], start_label=total - n + 1)
+                except ValueError:
+                    print("请输入有效数字。")
+            elif view_choice == "3":
+                try:
+                    n = int(input(f"显示前几条 (1-{total}): ").strip())
+                    if 1 <= n <= total:
+                        await _show_messages(messages[:n])
+                except ValueError:
+                    print("请输入有效数字。")
+            elif view_choice == "4":
+                try:
+                    x = int(input(f"起始 (1-{total}): ").strip())
+                    y = int(input(f"结束 ({x}-{total}): ").strip())
+                    if 1 <= x <= y <= total:
+                        await _show_messages(messages[x - 1 : y], start_label=x)
+                except ValueError:
+                    print("请输入有效数字。")
+
+
+# ─────────────────────────────────────────────────────────────
 # 主入口
 # ─────────────────────────────────────────────────────────────
 
 
 async def main():
-    async with AsyncRedisSaver.from_conn_string(DB_URI) as checkpointer, LongTermMemory(
-        DB_URI
-    ) as ltm:
-        while True:
-            # 动态扫描 Redis 中的会话 ID
-            r_scan = redis.from_url(DB_URI, decode_responses=True)
-            base_sessions, legacy_ids = await _scan_sessions(r_scan)
-            await r_scan.aclose()
+    # 初始化 MySQL（可选，失败降级）
+    memory_store = None
+    try:
+        memory_store = await MemoryStore.create(
+            host=MYSQL_HOST, port=MYSQL_PORT,
+            user=MYSQL_USER, password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE,
+        )
+        print("[OK] MySQL 归档已连接。\n")
+    except Exception as e:
+        print(f"[!] MySQL 不可用 ({e})，归档管理功能将跳过。\n")
 
-            total = len(base_sessions) + len(legacy_ids)
-            session_choices = [
-                (f"{sid}", f"new:{sid}") for sid in base_sessions
-            ]
-            if legacy_ids:
-                session_choices += [
-                    (f"[旧] {tid}", f"legacy:{tid}") for tid in legacy_ids
+        async with AsyncRedisSaver.from_conn_string(DB_URI) as checkpointer, LongTermMemory(
+            DB_URI
+        ) as ltm:
+            while True:
+                # 动态扫描 Redis 中的会话 ID
+                r_scan = redis.from_url(DB_URI, decode_responses=True)
+                base_sessions, legacy_ids = await _scan_sessions(r_scan)
+                await r_scan.aclose()
+    
+                total = len(base_sessions) + len(legacy_ids)
+                session_choices = [
+                    (f"{sid}", f"new:{sid}") for sid in base_sessions
                 ]
-            session_choices += [("长期记忆管理", "__ltm__"), ("退出", "q")]
-
-            choice = await prompt_ui.select(
-                f"记忆管理器 — 共 {total} 条会话记录：",
-                session_choices,
-            )
-
-            if choice == "q":
-                break
-
-            if choice == "__ltm__":
-                await manage_long_term_memories(ltm)
-                continue
-
-            if choice.startswith("legacy:"):
-                # 旧格式：直接操作该 thread_id
-                tid = choice[len("legacy:"):]
+                if legacy_ids:
+                    session_choices += [
+                        (f"[旧] {tid}", f"legacy:{tid}") for tid in legacy_ids
+                    ]
+                session_choices += [("长期记忆管理", "__ltm__")]
+                if memory_store is not None:
+                    session_choices.append(("MySQL 归档管理", "__mysql__"))
+                session_choices.append(("退出", "q"))
+    
+                choice = await prompt_ui.select(
+                    f"记忆管理器 — 共 {total} 条会话记录：",
+                    session_choices,
+                )
+    
+                if choice == "q":
+                    break
+    
+                if choice == "__ltm__":
+                    await manage_long_term_memories(ltm)
+                    continue
+    
+                if choice == "__mysql__":
+                    if memory_store is not None:
+                        await view_mysql_archives(memory_store)
+                    continue
+    
+                if choice.startswith("legacy:"):
+                    # 旧格式：直接操作该 thread_id
+                    tid = choice[len("legacy:"):]
+                    action = await prompt_ui.select(
+                        f"[旧] {tid}：",
+                        [
+                            ("查看记忆", "1"),
+                            ("删除记忆", "2"),
+                            ("返回", "q"),
+                        ],
+                    )
+                    if action == "q":
+                        continue
+                    elif action == "1":
+                        await view_memory(checkpointer, tid)
+                    elif action == "2":
+                        await delete_checkpoints(checkpointer, tid)
+                    continue
+    
+                # 新格式：展示子 Agent 列表
+                base_sid = choice[len("new:"):]
+                agent_choices = [
+                    (f"{label}  ({base_sid}{suffix})", f"{base_sid}{suffix}")
+                    for suffix, label in _ROLE_SUFFIXES
+                ]
+                agent_choices.append(("返回", "q"))
+    
+                agent_choice = await prompt_ui.select(
+                    f"会话 {base_sid} — 选择 Agent：",
+                    agent_choices,
+                )
+                if agent_choice == "q":
+                    continue
+    
+                tid = agent_choice
                 action = await prompt_ui.select(
-                    f"[旧] {tid}：",
+                    f"{tid}：",
                     [
                         ("查看记忆", "1"),
                         ("删除记忆", "2"),
                         ("返回", "q"),
                     ],
                 )
+    
                 if action == "q":
                     continue
                 elif action == "1":
                     await view_memory(checkpointer, tid)
                 elif action == "2":
                     await delete_checkpoints(checkpointer, tid)
-                continue
 
-            # 新格式：展示子 Agent 列表
-            base_sid = choice[len("new:"):]
-            agent_choices = [
-                (f"{label}  ({base_sid}{suffix})", f"{base_sid}{suffix}")
-                for suffix, label in _ROLE_SUFFIXES
-            ]
-            agent_choices.append(("返回", "q"))
-
-            agent_choice = await prompt_ui.select(
-                f"会话 {base_sid} — 选择 Agent：",
-                agent_choices,
-            )
-            if agent_choice == "q":
-                continue
-
-            tid = agent_choice
-            action = await prompt_ui.select(
-                f"{tid}：",
-                [
-                    ("查看记忆", "1"),
-                    ("删除记忆", "2"),
-                    ("返回", "q"),
-                ],
-            )
-
-            if action == "q":
-                continue
-            elif action == "1":
-                await view_memory(checkpointer, tid)
-            elif action == "2":
-                await delete_checkpoints(checkpointer, tid)
+    if memory_store is not None:
+        await memory_store.close()
+        print("[OK] MySQL 连接已关闭。")
 
 
 if __name__ == "__main__":
