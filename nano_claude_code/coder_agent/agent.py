@@ -5,25 +5,27 @@ from langgraph.graph import StateGraph, START
 from core.state import AgentState
 from core.tools import read_file
 from core.confirm import create_tool_confirm_node, make_agent_router, route_after_tool_confirm
-from coder_agent.tools import bash, write_file, edit_file
+from coder_agent.tools import bash, run_python, write_file, edit_file, read_sandbox_file
 from memory import create_compression_node, create_warn_node, make_token_router, route_after_warn
 
-_DANGEROUS = {"write_file", "edit_file"}
+_DANGEROUS = {"write_file", "edit_file", "bash", "run_python"}
 
 def create_coder_agent(model, checkpointer):
-    tools = [read_file, bash, write_file, edit_file]
+    tools = [read_file, bash, run_python, write_file, edit_file, read_sandbox_file]
     system_prompt = (
-        "你是一个编程专家。你的唯一职责是编写和修改代码文件。\n"
+        "你是一个编程专家，在 CubeSandbox KVM 沙箱中工作。每次会话共享同一个沙箱实例（状态持久）。\n"
         "你可以使用以下工具：\n"
-        "1. read_file — 在修改前先阅读文件内容\n"
-        "2. write_file — 创建新文件\n"
-        "3. edit_file — 精确替换文件中的片段\n"
-        "4. bash — 仅用于只读文件系统操作（如 ls、cat、grep、find），帮助定位文件或查看目录结构\n\n"
-        "严格限制：\n"
-        "- 绝对禁止运行任何 Python 脚本、测试或编译命令（如 python、pytest、npm test、make 等）\n"
-        "- 绝对禁止调用 todo_manager 更新任务状态\n"
-        "- 你的输出就是写完代码后的简短总结，交给 Manager 判断是否需要审查\n"
-        "- 确保代码可读且高效"
+        "1. read_file — 读取宿主机本地项目文件（只读，用于参考已有代码）\n"
+        "2. read_sandbox_file — 读取沙箱内已创建的文件\n"
+        "3. write_file — 在沙箱中创建新文件（路径相对于 /home/user/workspace/）\n"
+        "4. edit_file — 精确替换沙箱中文件的片段\n"
+        "5. bash — 在沙箱中执行 shell 命令（安装依赖、查看文件、运行脚本等）\n"
+        "6. run_python — 在沙箱中直接执行 Python 代码片段\n\n"
+        "沙箱说明：\n"
+        "- 所有代码执行均在隔离的 KVM MicroVM 中进行，宿主机完全安全\n"
+        "- 沙箱工作目录为 /home/user/workspace/\n"
+        "- 可以自由安装包（pip install）、执行任意命令，无需顾虑宿主机安全\n"
+        "- 完成编码后输出简短总结，交给 Manager 判断是否需要审查"
     )
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}
