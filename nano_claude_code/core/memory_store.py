@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 """
 
 ADD_TITLE_COLUMN_SQL = """
-ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title VARCHAR(100) DEFAULT NULL;
+ALTER TABLE conversations ADD COLUMN title VARCHAR(100) DEFAULT NULL;
 """
 
 CREATE_LTM_TABLE_SQL = """
@@ -78,10 +78,14 @@ class MemoryStore:
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLE_SQL)
                 await cur.execute(CREATE_LTM_TABLE_SQL)
-                try:
+                # 检查 title 列是否存在，不存在才加
+                await cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'conversations' AND COLUMN_NAME = 'title'"
+                )
+                row = await cur.fetchone()
+                if row and row[0] == 0:
                     await cur.execute(ADD_TITLE_COLUMN_SQL)
-                except Exception:
-                    pass
 
     async def archive(self, thread_id: str, messages: List[BaseMessage], title: Optional[str] = None) -> None:
         """Serialize messages to JSON and upsert into MySQL."""
