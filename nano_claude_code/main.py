@@ -280,7 +280,27 @@ async def _restore_from_mysql(thread_id: str, memory_store: MemoryStore, app, se
     return True
 
 
-async def _archive_to_mysql(thread_id: str, checkpointer, memory_store: MemoryStore) -> None:
+async def _generate_title(model, messages) -> str:
+    """用 LLM 根据对话内容生成简短标题。"""
+    try:
+        lines = []
+        for msg in messages[:10]:
+            content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(content, list):
+                content = json.dumps(content, ensure_ascii=False)
+            role = getattr(msg, "type", "?").upper()
+            lines.append(f"[{role}]: {str(content)[:200]}")
+        prompt = (
+            "请用不超过15个字概括以下对话的核心任务，只输出标题本身，不要标点符号和引号：\n\n"
+            + "\n".join(lines)
+        )
+        resp = await model.ainvoke([HumanMessage(content=prompt)])
+        return resp.content.strip()[:100]
+    except Exception:
+        return ""
+
+
+async def _archive_to_mysql(thread_id: str, checkpointer, memory_store: MemoryStore, model=None) -> None:
     """将 Redis checkpoint 中的消息归档到 MySQL。"""
     config = {"configurable": {"thread_id": thread_id}}
     try:
@@ -301,8 +321,14 @@ async def _archive_to_mysql(thread_id: str, checkpointer, memory_store: MemorySt
     if not messages:
         return
 
+    title = None
+    if model is not None:
+        title = await _generate_title(model, messages)
+        if title:
+            print(f"\033[36m[记忆] 会话标题：{title}\033[0m")
+
     try:
-        await memory_store.archive(thread_id, messages)
+        await memory_store.archive(thread_id, messages, title=title)
         print(f"\033[32m[记忆] 已将会话 {thread_id} 的 {len(messages)} 条消息归档到 MySQL。\033[0m")
     except Exception as e:
         print(f"\033[31m[记忆] 归档到 MySQL 失败: {e}\033[0m")
@@ -329,7 +355,7 @@ async def main():
 
     try:
         async with AsyncRedisSaver.from_conn_string(REDIS_URI, ttl=REDIS_TTL) as checkpointer, LongTermMemory(
-            REDIS_URI
+            REDIS_URI, memory_store=memory_store
         ) as ltm:
             cached_memories = await ltm.load_all()
         if cached_memories:
@@ -352,12 +378,14 @@ async def main():
         mysql_sessions = []
         _restored_from_mysql = False
         if memory_store is not None:
-            mysql_ids = await _scan_mysql_sessions(memory_store)
-            mysql_sessions = [mid for mid in mysql_ids if mid not in existing]
-            for mid in mysql_sessions:
-                info = await memory_store.load(mid)
-                msg_count = len(info) if info else 0
-                choices.append((f"🗄  从 MySQL 恢复: {mid} ({msg_count}条消息)", f"mysql:{mid}"))
+            threads = await memory_store.list_threads()
+            mysql_sessions = [t for t in threads if t["thread_id"] not in existing]
+            for t in mysql_sessions:
+                title_str = f"「{t['title']}」" if t.get("title") else t["thread_id"]
+                choices.append((
+                    f"🗄  {title_str}  ({t['message_count']}条消息  {str(t['updated_at'])[:16]})",
+                    f"mysql:{t['thread_id']}"
+                ))
 
         choices.append(("✨  新建会话", "__new__"))
         pick = await prompt_ui.select("请选择会话：", choices)
@@ -759,7 +787,7 @@ async def main():
         # ── 归档完整对话到 MySQL ────────────────────────────────────────
         if memory_store is not None:
             print("\n[*] 正在归档会话到 MySQL...")
-            await _archive_to_mysql(session_id, checkpointer, memory_store)
+            await _archive_to_mysql(session_id, checkpointer, memory_store, model=model)
 
     finally:
         if memory_store is not None:

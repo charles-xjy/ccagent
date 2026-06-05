@@ -36,9 +36,10 @@ class LongTermMemory:
     _INDEX = "ltm:index"
     _PREFIX = "ltm:mem:"
 
-    def __init__(self, redis_url: str):
+    def __init__(self, redis_url: str, memory_store=None):
         self._url = redis_url
         self._r: redis.Redis | None = None
+        self._store = memory_store  # MemoryStore 实例，可选
 
     async def __aenter__(self):
         self._r = redis.from_url(self._url, decode_responses=True)
@@ -50,19 +51,32 @@ class LongTermMemory:
 
     async def save(self, type: str, name: str, description: str, content: str) -> str:
         mem_id = uuid.uuid4().hex[:8]
-        await self._r.hset(f"{self._PREFIX}{mem_id}", mapping={
+        created_at = datetime.now().isoformat()
+        mapping = {
             "id": mem_id,
             "type": type,
             "name": name,
             "description": description,
             "content": content,
-            "created_at": datetime.now().isoformat(),
-        })
+            "created_at": created_at,
+        }
+        # 写 Redis
+        await self._r.hset(f"{self._PREFIX}{mem_id}", mapping=mapping)
         await self._r.sadd(self._INDEX, mem_id)
+        # 双写 MySQL
+        if self._store is not None:
+            try:
+                await self._store.save_ltm(mem_id, type, name, description, content, created_at)
+            except Exception as e:
+                print(f"[!] 长期记忆双写 MySQL 失败: {e}")
         return mem_id
 
     async def load_all(self) -> List[Dict]:
         ids = await self._r.smembers(self._INDEX)
+        # Redis 为空且有 MySQL 备份，自动恢复
+        if not ids and self._store is not None:
+            await self._restore_from_mysql()
+            ids = await self._r.smembers(self._INDEX)
         mems = []
         for mid in ids:
             data = await self._r.hgetall(f"{self._PREFIX}{mid}")
@@ -71,9 +85,35 @@ class LongTermMemory:
         mems.sort(key=lambda x: x.get("created_at", ""))
         return mems
 
+    async def _restore_from_mysql(self) -> None:
+        """Redis 长期记忆为空时从 MySQL 全量恢复。"""
+        try:
+            rows = await self._store.load_all_ltm()
+            if not rows:
+                return
+            for row in rows:
+                mid = row["id"]
+                await self._r.hset(f"{self._PREFIX}{mid}", mapping={
+                    "id": mid,
+                    "type": row["type"],
+                    "name": row["name"],
+                    "description": row.get("description", ""),
+                    "content": row.get("content", ""),
+                    "created_at": str(row.get("created_at", "")),
+                })
+                await self._r.sadd(self._INDEX, mid)
+            print(f"\033[33m[记忆] 从 MySQL 恢复了 {len(rows)} 条长期记忆到 Redis。\033[0m")
+        except Exception as e:
+            print(f"[!] 从 MySQL 恢复长期记忆失败: {e}")
+
     async def delete(self, mem_id: str):
         await self._r.delete(f"{self._PREFIX}{mem_id}")
         await self._r.srem(self._INDEX, mem_id)
+        if self._store is not None:
+            try:
+                await self._store.delete_ltm(mem_id)
+            except Exception as e:
+                print(f"[!] 长期记忆删除 MySQL 失败: {e}")
 
     async def delete_all(self):
         ids = await self._r.smembers(self._INDEX)
@@ -81,6 +121,11 @@ class LongTermMemory:
             await self._r.delete(f"{self._PREFIX}{mid}")
         if ids:
             await self._r.delete(self._INDEX)
+        if self._store is not None:
+            try:
+                await self._store.delete_all_ltm()
+            except Exception as e:
+                print(f"[!] 长期记忆清空 MySQL 失败: {e}")
 
     def format_for_prompt(self, memories: List[Dict]) -> str:
         if not memories:

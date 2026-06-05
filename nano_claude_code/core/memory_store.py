@@ -11,11 +11,28 @@ CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     thread_id VARCHAR(255) NOT NULL UNIQUE,
+    title VARCHAR(100) DEFAULT NULL,
     messages_json LONGTEXT NOT NULL,
     message_count INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_thread_id (thread_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+ADD_TITLE_COLUMN_SQL = """
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title VARCHAR(100) DEFAULT NULL;
+"""
+
+CREATE_LTM_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS long_term_memories (
+    id VARCHAR(8) PRIMARY KEY,
+    type VARCHAR(20) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    description VARCHAR(255),
+    content TEXT,
+    created_at DATETIME,
+    INDEX idx_type (type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
@@ -60,20 +77,26 @@ class MemoryStore:
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLE_SQL)
+                await cur.execute(CREATE_LTM_TABLE_SQL)
+                try:
+                    await cur.execute(ADD_TITLE_COLUMN_SQL)
+                except Exception:
+                    pass
 
-    async def archive(self, thread_id: str, messages: List[BaseMessage]) -> None:
+    async def archive(self, thread_id: str, messages: List[BaseMessage], title: Optional[str] = None) -> None:
         """Serialize messages to JSON and upsert into MySQL."""
         messages_json = dumps(messages)
         message_count = len(messages)
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO conversations (thread_id, messages_json, message_count) "
-                    "VALUES (%s, %s, %s) "
+                    "INSERT INTO conversations (thread_id, title, messages_json, message_count) "
+                    "VALUES (%s, %s, %s, %s) "
                     "AS new_row ON DUPLICATE KEY UPDATE "
+                    "title = COALESCE(new_row.title, conversations.title), "
                     "messages_json = new_row.messages_json, "
                     "message_count = new_row.message_count",
-                    (thread_id, messages_json, message_count),
+                    (thread_id, title, messages_json, message_count),
                 )
         logger.info("Archived thread '%s' (%d messages) to MySQL", thread_id, message_count)
 
@@ -110,11 +133,40 @@ class MemoryStore:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "SELECT thread_id, message_count, created_at, updated_at "
+                    "SELECT thread_id, title, message_count, created_at, updated_at "
                     "FROM conversations ORDER BY updated_at DESC"
                 )
                 rows = await cur.fetchall()
         return rows
+
+    async def save_ltm(self, mem_id: str, type: str, name: str, description: str, content: str, created_at: str) -> None:
+        """将一条长期记忆写入 MySQL（双写备份）。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT IGNORE INTO long_term_memories (id, type, name, description, content, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (mem_id, type, name, description, content, created_at),
+                )
+
+    async def delete_ltm(self, mem_id: str) -> None:
+        """删除一条长期记忆。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM long_term_memories WHERE id = %s", (mem_id,))
+
+    async def delete_all_ltm(self) -> None:
+        """清空全部长期记忆。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM long_term_memories")
+
+    async def load_all_ltm(self) -> List[dict]:
+        """从 MySQL 加载全部长期记忆，用于 Redis 崩溃后恢复。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute("SELECT * FROM long_term_memories ORDER BY created_at ASC")
+                return await cur.fetchall()
 
     async def close(self) -> None:
         self.pool.close()

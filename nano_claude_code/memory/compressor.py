@@ -16,6 +16,7 @@ import json
 from datetime import datetime
 from typing import List
 
+import redis.asyncio as redis
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -24,7 +25,10 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
+
+from core.config import REDIS_URI
 
 # ── 压缩触发参数 ──────────────────────────────────────────────
 KEEP_RECENT = 3  # 无论如何保留最近 N 条消息原文
@@ -89,10 +93,41 @@ def needs_compression(
 # ── 工厂函数 ──────────────────────────────────────────────────
 
 
+async def _cleanup_old_checkpoints(thread_id: str, keep: int = 2) -> None:
+    """压缩后清理旧 checkpoint，只保留最新 keep 个。"""
+    try:
+        r = redis.from_url(REDIS_URI, decode_responses=True)
+        # 找出该 thread 的所有 checkpoint key（排除指针 key 和 writes key）
+        all_keys = await r.keys(f"checkpoint:{thread_id}:*")
+        cp_keys = [
+            k for k in all_keys
+            if "checkpoint_writes" not in k and not k.endswith(f"{thread_id}::")
+        ]
+        if len(cp_keys) <= keep:
+            await r.aclose()
+            return
+        # checkpoint_id 是 ULID/UUID，字典序即时间序，倒序取最新 keep 个
+        cp_keys.sort(reverse=True)
+        to_delete = cp_keys[keep:]
+        # 同时删除对应的 checkpoint_writes key
+        writes_to_delete = []
+        for k in to_delete:
+            cp_id = k.rsplit(":", 1)[-1]
+            writes_keys = await r.keys(f"checkpoint_writes:{thread_id}:*{cp_id}*")
+            writes_to_delete.extend(writes_keys)
+        all_to_delete = to_delete + writes_to_delete
+        if all_to_delete:
+            await r.delete(*all_to_delete)
+            print(f"\033[36m[压缩-清理] 删除 {len(all_to_delete)} 个旧 checkpoint key，保留最新 {keep} 个\033[0m")
+        await r.aclose()
+    except Exception as e:
+        print(f"\033[33m[压缩-清理] 清理旧 checkpoint 失败: {e}\033[0m")
+
+
 def create_compression_node(model):
     """返回绑定了 model 的异步压缩节点函数。"""
 
-    async def compression_node(state: dict) -> dict:
+    async def compression_node(state: dict, config: RunnableConfig = None) -> dict:
         messages: List[BaseMessage] = state.get("messages", [])
 
         if len(messages) <= KEEP_RECENT:
@@ -118,6 +153,9 @@ def create_compression_node(model):
                         RemoveMessage(id=m.id) for m in to_remove if hasattr(m, "id")
                     ]
                     print(f"\033[33m[压缩-P1] 清理 {len(removes)} 条旧 ToolMessage\033[0m")
+                    thread_id = (config or {}).get("configurable", {}).get("thread_id", "")
+                    if thread_id:
+                        await _cleanup_old_checkpoints(thread_id)
                     return {"messages": removes}
 
         # ── Phase 2: 生成摘要替换旧消息 ────────────────────────
@@ -157,6 +195,9 @@ def create_compression_node(model):
             # 删除所有旧消息，按 [summary, recent...] 顺序重建
             # add_messages 处理顺序：先执行 Remove，再追加新消息
             removes = [RemoveMessage(id=m.id) for m in messages if hasattr(m, "id")]
+            thread_id = (config or {}).get("configurable", {}).get("thread_id", "")
+            if thread_id:
+                await _cleanup_old_checkpoints(thread_id)
             return {"messages": removes + [summary_msg] + list(recent), "compress_choice": ""}
 
         except Exception as e:
