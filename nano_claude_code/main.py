@@ -446,7 +446,14 @@ async def main():
                         break
 
             todo_status = json.dumps(current_todo, ensure_ascii=False)
-            mem_section = ltm.format_for_prompt(cached_memories)
+            # 用当前用户消息做混合检索，只注入相关记忆
+            last_human = next(
+                (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None
+            )
+            query = last_human.content if last_human else ""
+            if isinstance(query, list):
+                query = " ".join(str(p) for p in query)
+            mem_section = await ltm.search_for_prompt(query)
             system_content = (
                 f"你是一个高级编程协调员 (Manager)。当前工作路径: {WORKDIR}\n"
             )

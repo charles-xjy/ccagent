@@ -153,6 +153,15 @@ class MemoryStore:
                     (mem_id, type, name, description, content, created_at),
                 )
 
+    async def update_ltm(self, mem_id: str, content: str) -> None:
+        """更新一条长期记忆的内容。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE long_term_memories SET content = %s WHERE id = %s",
+                    (content, mem_id),
+                )
+
     async def delete_ltm(self, mem_id: str) -> None:
         """删除一条长期记忆。"""
         async with self.pool.acquire() as conn:
