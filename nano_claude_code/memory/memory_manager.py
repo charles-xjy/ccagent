@@ -2,6 +2,10 @@ import asyncio
 import re
 import sys
 import os
+import warnings
+
+warnings.filterwarnings("ignore", message="The default value of `allowed_objects`")
+
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 # 直接运行时确保父包可寻址

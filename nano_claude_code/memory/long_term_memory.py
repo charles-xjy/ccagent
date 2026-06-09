@@ -12,21 +12,27 @@ from redis.commands.search.field import TagField, TextField, VectorField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
 
-MEMORY_TYPES = ("user", "feedback", "project", "reference")
+MEMORY_TYPES = ("user", "feedback", "build", "architecture", "style", "workflow", "reference")
 
 _TYPE_LABELS = {
-    "user":      "用户信息",
-    "feedback":  "行为反馈",
-    "project":   "项目上下文",
-    "reference": "资源引用",
+    "user":         "用户信息",
+    "feedback":     "行为反馈",
+    "build":        "构建与调试",
+    "architecture": "架构决策",
+    "style":        "代码风格",
+    "workflow":     "工作流习惯",
+    "reference":    "资源引用",
 }
 
 _EXTRACT_PROMPT = """你是一个记忆提炼助手。请从以下对话中提炼值得跨会话保留的信息。
 
-只提炼 4 种类型：
+只提炼 7 种类型：
 - user: 用户偏好、知识背景、工作角色
 - feedback: 用户纠正了 AI 行为，或确认了某种非显而易见的做法（含 Why 和 How to apply）
-- project: 当前项目的关键决策、目标、技术约束、截止日期
+- build: 构建命令、运行方式、调试技巧、环境配置（如何跑起来、如何排查问题）
+- architecture: 架构决策与设计理由（选了什么方案、为什么、放弃了什么）
+- style: 代码风格偏好（命名规范、注释习惯、格式约定）
+- workflow: 工作流习惯（分支策略、提交规范、review 流程、工具链偏好）
 - reference: 外部资源位置（URL、文件路径、服务地址）
 
 只提炼真正有价值、未来对话会用到的信息。没有则返回空列表 []。

@@ -2,6 +2,9 @@ import asyncio
 import json
 import re
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", message="The default value of `allowed_objects`")
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

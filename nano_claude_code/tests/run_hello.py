@@ -17,17 +17,18 @@ import sys
 from dotenv import load_dotenv
 
 # .env 在 nano_claude_code/ 下，显式指定路径
-_ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+_ENV_FILE = os.path.join(os.path.dirname(__file__), "../.env")
 load_dotenv(_ENV_FILE)
 
 # sandbox.py 在 nano_claude_code/core/ 下，把项目根加入路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from nano_claude_code.core.sandbox import get_sandbox, reset_sandbox
 
-HELLO_CODE = """\
+HELLO_CODE = """
 message = "Hello, World!"
 print(message)
+print()
 print(f"Python 版本: {__import__('sys').version}")
 print(f"运行平台: {__import__('platform').system()} {__import__('platform').release()}")
 """
@@ -45,6 +46,13 @@ def main():
     print("=" * 40)
     print(result)
     print("=" * 40)
+
+    print("\n[*] 查询显卡占用...")
+    try:
+        gpu = sb.run_command("nvidia-smi")
+        print(gpu)
+    except Exception as e:
+        print(f"[!] nvidia-smi 不可用: {e}")
 
     reset_sandbox()
     print("\n[OK] 沙箱已销毁。")
