@@ -11,7 +11,7 @@ def get_model():
 
 # Redis — hot storage for active LangGraph checkpoints
 REDIS_URI = "redis://10.129.107.145:6379"
-REDIS_TTL = 604800  # 7天不活跃的 checkpoint 自动过期，淘汰后走 MySQL 恢复
+REDIS_TTL = 604800  # 秒，传给 AsyncRedisSaver 的 ttl={"default_ttl": REDIS_TTL}
 
 # MySQL — cold storage for archived conversation history
 MYSQL_HOST = "10.129.107.145"
