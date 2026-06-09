@@ -517,95 +517,73 @@ async def main():
     except Exception as e:
         print(f"[!] MySQL 不可用 ({e})，归档管理功能将跳过。\n")
 
-        async with AsyncRedisSaver.from_conn_string(DB_URI) as checkpointer, LongTermMemory(
-            DB_URI
-        ) as ltm:
-            while True:
-                # 动态扫描 Redis 中的会话 ID
-                r_scan = redis.from_url(DB_URI, decode_responses=True)
-                base_sessions, legacy_ids = await _scan_sessions(r_scan)
-                await r_scan.aclose()
-    
-                total = len(base_sessions) + len(legacy_ids)
-                session_choices = [
-                    (f"{sid}", f"new:{sid}") for sid in base_sessions
-                ]
-                if legacy_ids:
-                    session_choices += [
-                        (f"[旧] {tid}", f"legacy:{tid}") for tid in legacy_ids
-                    ]
-                session_choices += [("长期记忆管理", "__ltm__")]
+    async with AsyncRedisSaver.from_conn_string(DB_URI) as checkpointer, \
+               LongTermMemory(DB_URI) as ltm:
+        while True:
+            r_scan = redis.from_url(DB_URI, decode_responses=True)
+            base_sessions, legacy_ids = await _scan_sessions(r_scan)
+            await r_scan.aclose()
+
+            total = len(base_sessions) + len(legacy_ids)
+            session_choices = [(f"{sid}", f"new:{sid}") for sid in base_sessions]
+            if legacy_ids:
+                session_choices += [(f"[旧] {tid}", f"legacy:{tid}") for tid in legacy_ids]
+            session_choices += [("长期记忆管理", "__ltm__")]
+            if memory_store is not None:
+                session_choices.append(("MySQL 归档管理", "__mysql__"))
+            session_choices.append(("退出", "q"))
+
+            choice = await prompt_ui.select(
+                f"记忆管理器 — 共 {total} 条会话记录：",
+                session_choices,
+            )
+
+            if choice == "q":
+                break
+
+            if choice == "__ltm__":
+                await manage_long_term_memories(ltm)
+                continue
+
+            if choice == "__mysql__":
                 if memory_store is not None:
-                    session_choices.append(("MySQL 归档管理", "__mysql__"))
-                session_choices.append(("退出", "q"))
-    
-                choice = await prompt_ui.select(
-                    f"记忆管理器 — 共 {total} 条会话记录：",
-                    session_choices,
-                )
-    
-                if choice == "q":
-                    break
-    
-                if choice == "__ltm__":
-                    await manage_long_term_memories(ltm)
-                    continue
-    
-                if choice == "__mysql__":
-                    if memory_store is not None:
-                        await view_mysql_archives(memory_store)
-                    continue
-    
-                if choice.startswith("legacy:"):
-                    # 旧格式：直接操作该 thread_id
-                    tid = choice[len("legacy:"):]
-                    action = await prompt_ui.select(
-                        f"[旧] {tid}：",
-                        [
-                            ("查看记忆", "1"),
-                            ("删除记忆", "2"),
-                            ("返回", "q"),
-                        ],
-                    )
-                    if action == "q":
-                        continue
-                    elif action == "1":
-                        await view_memory(checkpointer, tid)
-                    elif action == "2":
-                        await delete_checkpoints(checkpointer, tid)
-                    continue
-    
-                # 新格式：展示子 Agent 列表
-                base_sid = choice[len("new:"):]
-                agent_choices = [
-                    (f"{label}  ({base_sid}{suffix})", f"{base_sid}{suffix}")
-                    for suffix, label in _ROLE_SUFFIXES
-                ]
-                agent_choices.append(("返回", "q"))
-    
-                agent_choice = await prompt_ui.select(
-                    f"会话 {base_sid} — 选择 Agent：",
-                    agent_choices,
-                )
-                if agent_choice == "q":
-                    continue
-    
-                tid = agent_choice
+                    await view_mysql_archives(memory_store)
+                continue
+
+            if choice.startswith("legacy:"):
+                tid = choice[len("legacy:"):]
                 action = await prompt_ui.select(
-                    f"{tid}：",
-                    [
-                        ("查看记忆", "1"),
-                        ("删除记忆", "2"),
-                        ("返回", "q"),
-                    ],
+                    f"[旧] {tid}：",
+                    [("查看记忆", "1"), ("删除记忆", "2"), ("返回", "q")],
                 )
-    
-                if action == "q":
-                    continue
-                elif action == "1":
+                if action == "1":
                     await view_memory(checkpointer, tid)
                 elif action == "2":
                     await delete_checkpoints(checkpointer, tid)
+                continue
+
+            # 新格式：展示子 Agent 列表
+            base_sid = choice[len("new:"):]
+            agent_choices = [
+                (f"{label}  ({base_sid}{suffix})", f"{base_sid}{suffix}")
+                for suffix, label in _ROLE_SUFFIXES
+            ]
+            agent_choices.append(("返回", "q"))
+
+            agent_choice = await prompt_ui.select(
+                f"会话 {base_sid} — 选择 Agent：", agent_choices
+            )
+            if agent_choice == "q":
+                continue
+
+            action = await prompt_ui.select(
+                f"{agent_choice}：",
+                [("查看记忆", "1"), ("删除记忆", "2"), ("返回", "q")],
+            )
+            if action == "1":
+                await view_memory(checkpointer, agent_choice)
+            elif action == "2":
+                await delete_checkpoints(checkpointer, agent_choice)
 
     if memory_store is not None:
         await memory_store.close()

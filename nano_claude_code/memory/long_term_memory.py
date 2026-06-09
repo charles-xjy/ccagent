@@ -58,7 +58,10 @@ _DEDUP_PROMPT = """你是记忆去重助手。判断新记忆与已有相似记�
 _MODELSCOPE_MODEL_ID = "BAAI/bge-small-zh-v1.5"
 _EMBED_DIM = 512
 _DEDUP_SIM_THRESHOLD = 0.78
-_SEARCH_TOP_K = 8
+_SEARCH_TOP_K = 3               # 最终注入 Prompt 的条数
+_SEARCH_SIM_THRESHOLD = 0.75   # HNSW 召回阈值（低于此相似度的候选直接丢弃）
+_SEARCH_MAX_CANDIDATES = 10    # HNSW 最大召回数，确保阈值过滤后仍有足够候选
+_RRF_K = 60                    # RRF 平滑系数
 _INDEX_NAME = "ltm:idx"
 _INDEX_PREFIX = "ltm:mem:"
 _SET_KEY = "ltm:index"
@@ -268,20 +271,20 @@ class LongTermMemory:
 
     async def search(self, query: str, top_k: int = _SEARCH_TOP_K) -> List[Dict]:
         """
-        HNSW KNN 取候选 → BM25 re-ranking 返回 top_k。
-        COSINE distance = 1 - cosine_similarity（值越小越相似）。
+        ① HNSW 召回相似度 ≥ _SEARCH_SIM_THRESHOLD 的全部候选（阈值过滤，非 top-k 截断）
+        ② RRF 融合 HNSW 排名和 BM25 排名：RRF(d) = Σ 1/(k+rank_i)，k=60
+        ③ 按 RRF 分数降序取 top_k
         """
         if not query.strip():
             return (await self.load_all())[:top_k]
 
         query_vec = _embed(query)
-        candidate_k = min(top_k * 3, 30)
 
         q = (
-            Query(f"*=>[KNN {candidate_k} @embedding $vec AS dist]")
+            Query(f"*=>[KNN {_SEARCH_MAX_CANDIDATES} @embedding $vec AS dist]")
             .sort_by("dist")
             .return_fields("id", "type", "name", "description", "content", "created_at", "dist")
-            .paging(0, candidate_k)
+            .paging(0, _SEARCH_MAX_CANDIDATES)
             .dialect(2)
         )
         try:
@@ -292,35 +295,45 @@ class LongTermMemory:
             print(f"[!] HNSW 搜索失败，降级到全量加载: {e}")
             return (await self.load_all())[:top_k]
 
+        # ① 阈值过滤（COSINE distance = 1 - similarity，candidates 已按 dist 升序）
         candidates = []
         for doc in results.docs:
             dist = float(_d(getattr(doc, "dist", "1.0")))
-            candidates.append({
-                "id":          _d(doc.id).removeprefix(_INDEX_PREFIX),
-                "type":        _d(getattr(doc, "type", b"")),
-                "name":        _d(getattr(doc, "name", b"")),
-                "description": _d(getattr(doc, "description", b"")),
-                "content":     _d(getattr(doc, "content", b"")),
-                "created_at":  _d(getattr(doc, "created_at", b"")),
-                "_vec_sim":    1.0 - dist,   # 转换为相似度
-            })
+            if (1.0 - dist) >= _SEARCH_SIM_THRESHOLD:
+                candidates.append({
+                    "id":          _d(doc.id).removeprefix(_INDEX_PREFIX),
+                    "type":        _d(getattr(doc, "type", b"")),
+                    "name":        _d(getattr(doc, "name", b"")),
+                    "description": _d(getattr(doc, "description", b"")),
+                    "content":     _d(getattr(doc, "content", b"")),
+                    "created_at":  _d(getattr(doc, "created_at", b"")),
+                })
 
         if not candidates:
             return []
 
-        # BM25 re-ranking
+        # ② RRF 融合
+        # HNSW 排名已隐含于 candidates 顺序（dist 升序 = sim 降序）
         corpus = [f"{m['name']} {m['description']} {m['content']}" for m in candidates]
         bm25_scores = BM25Okapi([doc.split() for doc in corpus]).get_scores(query.split()).tolist()
+        bm25_rank = {
+            idx: rank
+            for rank, idx in enumerate(
+                sorted(range(len(bm25_scores)), key=lambda x: bm25_scores[x], reverse=True)
+            )
+        }
 
-        max_v = max((m["_vec_sim"] for m in candidates), default=1.0) or 1.0
-        max_b = max(bm25_scores, default=1.0) or 1.0
-
-        ranked = sorted(
-            enumerate(candidates),
-            key=lambda t: 0.6 * (t[1]["_vec_sim"] / max_v) + 0.4 * (bm25_scores[t[0]] / max_b),
+        rrf_scored = sorted(
+            (
+                (1.0 / (_RRF_K + hnsw_rank) + 1.0 / (_RRF_K + bm25_rank[hnsw_rank]), m)
+                for hnsw_rank, m in enumerate(candidates)
+            ),
+            key=lambda x: x[0],
             reverse=True,
         )
-        return [m for _, m in ranked[:top_k]]
+
+        # ③ 取 top_k
+        return [m for _, m in rrf_scored[:top_k]]
 
     async def _knn_similar(self, embedding: np.ndarray, top_k: int = 3) -> List[Dict]:
         """去重时用 HNSW 快速找最近邻，只返回超过阈值的结果。"""

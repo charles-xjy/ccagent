@@ -556,12 +556,10 @@ async def main():
             except Exception as e:
                 print(f"[!] 记忆提炼出错: {e}")
 
-            if memory_store is not None:
-                print("\n[*] 正在归档会话到 MySQL...")
-                await _archive_to_mysql(session_id, checkpointer, memory_store, model=model)
-
     finally:
         if memory_store is not None:
+            print("\n[*] 正在归档会话到 MySQL...")
+            await _archive_to_mysql(session_id, checkpointer, memory_store, model=model)
             await memory_store.close()
             print("\033[32m[OK] MySQL 连接已关闭。\033[0m")
 
