@@ -10,16 +10,21 @@
 用户输入
    │
    ▼
-Intent Agent（需求分析与文档生成）
+Supervisor（任务规划 + 路由调度）
    │
-   ▼
-Manager Agent（任务规划 + 路由调度）
-   ├──► Coder Agent       （编写/修改代码，执行 Shell）
-   ├──► Researcher Agent  （技术调研，MCP 工具调用）
-   └──► Reviewer Agent    （代码审查，测试执行）
+   ├──[需求不确定时]──► analyze_intent（Q&A 澄清 + 需求文档生成）
+   │                         │
+   │                    确认后继续规划
+   │
+   └──► spawn_agents（并行启动子 Agent）
+            ├──► skills=[coder]      （编写/修改代码，执行 Shell）
+            ├──► skills=[researcher] （技术调研，MCP 工具调用）
+            └──► skills=[reviewer]   （代码审查，测试执行）
 ```
 
-所有 Agent 均运行在独立的 LangGraph 子图中，上下文彼此隔离，通过 Manager 传递任务摘要而非原始消息流。
+子 Agent 不再是固定的独立模块，而是通过 **skill 注入** 动态组装——`skills/` 目录下的 Markdown 文件定义角色身份和工具权限，多个 skill 可叠加（如 `["coder", "react-patterns"]`）。
+
+`analyze_intent` 是 Supervisor 的一个工具，仅在需求边界不清晰时主动调用（如新功能目标明确但实现方式未定），需求清晰的任务直接进入执行阶段。
 
 ---
 
@@ -27,22 +32,36 @@ Manager Agent（任务规划 + 路由调度）
 
 ### 上下文隔离防止任务飘逸
 
-传统单 Agent 方案在复杂任务中容易出现"上下文污染"——前一个子任务的细节干扰后续决策，导致任务偏离。CCAgent 采用 **Supervisor 架构**，每个专家 Agent 持有独立的 thread_id，上下文完全隔离：
+传统单 Agent 方案在复杂任务中容易出现"上下文污染"——前一个子任务的细节干扰后续决策，导致任务偏离。CCAgent 采用 **Supervisor 架构**，子 Agent 通过 `run_agent()` 独立运行，上下文彼此隔离：
 
-- **Manager**：只负责任务规划与路由，不接触代码细节
+- **Supervisor**：只负责任务规划与路由，不接触代码细节
 - **Coder**：只处理编码任务，不感知调研内容
 - **Researcher**：只做技术调研，结果以摘要形式回传
 - **Reviewer**：只做代码审查与测试，独立于编写过程
 
-Manager 通过结构化的任务指令（而非消息转发）与子 Agent 通信，天然隔断了上下文串扰。
+Supervisor 通过结构化的任务指令（而非消息转发）与子 Agent 通信，天然隔断了上下文串扰。
+
+### Skill 系统：动态角色组装
+
+子 Agent 的身份和能力由 `skills/` 目录下的 Markdown 文件定义，Supervisor 在 `spawn_agents` 时按需注入：
+
+```
+skills/
+├── coder.md       # 编码专家角色定义 + 允许使用的工具白名单
+├── researcher.md  # 调研专家角色定义
+├── reviewer.md    # 审查专家角色定义
+└── *.md           # 可按技术领域自由扩展（react-patterns、fastapi 等）
+```
+
+多个 skill 可叠加，例如 `["coder", "react-patterns"]` 让 Coder 额外具备 React 领域知识。新增领域 skill 无需修改任何代码。
 
 ### 强制审查闭环
 
-Coder 完成编码后，Manager 被要求**强制调用 Reviewer** 审查，只有 Reviewer 通过后任务才能标记为完成，避免未经验证的代码直接交付。
+Coder 完成编码后，Supervisor 被要求**强制调用 Reviewer** 审查，只有 Reviewer 通过后任务才能标记为完成，避免未经验证的代码直接交付。
 
 ### MCP 工具扩展
 
-Researcher Agent 支持 MCP（Model Context Protocol）工具动态加载，可在运行时接入外部知识源、API 和数据库，无需修改代码。
+Researcher 支持 MCP（Model Context Protocol）工具动态加载，可在运行时接入外部知识源、API 和数据库，无需修改代码。
 
 ---
 
@@ -183,15 +202,24 @@ nano_claude_code/
 ├── main.py                  # 主入口，图定义，会话管理
 ├── core/
 │   ├── config.py            # 模型与存储配置
-│   ├── sandbox.py           # e2b 沙箱会话管理
+│   ├── sandbox.py           # e2b 沙箱会话管理（含 SSL/DNS patch）
+│   ├── tools.py             # 工具集（沙箱执行、文件读写、搜索等）
+│   ├── agent_runner.py      # 轻量子 Agent 运行器（无 LangGraph）
+│   ├── agent_loader.py      # Skill 加载与工具白名单解析
+│   ├── spawn_tool.py        # spawn_agents 工具，并行启动子 Agent
 │   ├── memory_store.py      # MySQL 归档与长期记忆备份
-│   └── tools.py             # 通用工具
+│   └── mcp.py               # MCP 工具加载
+├── intent_agent/
+│   └── agent.py             # analyze_intent 工具（需求 Q&A + 文档生成）
 ├── memory/
 │   ├── long_term_memory.py  # 长期记忆：HNSW检索、去重Pipeline
 │   ├── compressor.py        # 上下文两阶段压缩
 │   └── memory_manager.py    # 记忆管理 CLI（查看/删除）
-├── coder_agent/             # 编码专家（沙箱工具）
-├── researcher_agent/        # 调研专家（MCP工具）
-├── reviewer_agent/          # 审查专家（测试执行）
-└── intent_agent/            # 需求分析与文档生成
+├── skills/                  # Skill 定义文件（角色身份 + 工具权限）
+│   ├── coder.md
+│   ├── researcher.md
+│   ├── reviewer.md
+│   └── *.md                 # 可自由扩展领域 skill
+└── tests/
+    └── test_sandbox.py      # 沙箱单元测试（23 个）
 ```

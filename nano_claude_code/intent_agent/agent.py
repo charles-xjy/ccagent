@@ -1,15 +1,14 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.tools import tool as lc_tool
 from langgraph.types import interrupt
 
 from core.tools import WORKDIR
 
 
 def _strip_thinking(content: str) -> str:
-    """去除模型输出中的思考过程（</think> 之前的内容）。"""
     for tag in ("</think>", "</thinking>"):
         if tag in content:
             return content.split(tag, 1)[1].strip()
@@ -37,29 +36,32 @@ _DOC_PROMPT = (
 )
 
 
-def create_intent_node(model, project_name: str = ""):
-    """返回意图分析节点函数，挂载到主图的 START 之后。"""
+def create_intent_tool(model, project_name: str = ""):
+    """
+    返回 analyze_intent 工具，挂载到 Supervisor 的工具集。
+    Supervisor 对复杂任务主动调用，内部通过 interrupt 与用户交互。
+    """
 
-    async def intent_analysis_node(state: Dict) -> Dict:
-        # 恢复旧会话时（已有 AI 消息）跳过意图分析，直接让 manager 继续
-        if any(isinstance(m, AIMessage) for m in state.get("messages", [])):
-            return {}
+    @lc_tool
+    async def analyze_intent(user_request: str) -> str:
+        """
+        当需求不确定时，与用户进行交互式 Q&A，澄清后生成 Markdown 需求文档。
 
-        # 取最后一条用户消息作为原始需求
-        user_request = ""
-        for msg in reversed(state.get("messages", [])):
-            if isinstance(msg, HumanMessage):
-                user_request = msg.content
-                break
-        if not user_request:
-            return {}
+        调用时机（需求不确定）：
+        - 用户描述了目标但未说明实现方式（「加个分享功能」「支持多租户」）
+        - 新功能涉及数据结构、接口设计或与现有代码的集成方式尚未确定
+        - 项目已有代码，但后续扩展方向仍存在多种可能性
 
+        无需调用（需求已明确）：
+        - 修 bug、改样式、重构指定模块等目标和边界清晰的任务
+        - 用户已提供足够细节（接口、字段、行为均已说明）
+        """
         history = [
             SystemMessage(content=_SYSTEM_PROMPT),
             HumanMessage(content=user_request),
         ]
 
-        # ── Q&A 循环：直到用户完成回答或模型输出 [READY] ──────────
+        # ── Q&A 循环 ─────────────────────────────────────────────
         while True:
             response = await model.ainvoke(history)
             history.append(response)
@@ -71,17 +73,16 @@ def create_intent_node(model, project_name: str = ""):
             user_str = str(user_input).strip()
 
             if user_str.lower() == "skip":
-                return {}  # 跳过意图分析，直接让 manager 处理原始需求
+                return f"[需求澄清已跳过]\n原始需求：{user_request}"
 
             if user_str.lower() in ("done", "") or model_ready:
-                # 用户表示已回答完毕，或模型认为信息足够
                 if user_str and user_str.lower() not in ("done", ""):
                     history.append(HumanMessage(content=user_str))
                 break
 
             history.append(HumanMessage(content=user_str))
 
-        # ── 文档生成 + 确认循环 ───────────────────────────────────
+        # ── 文档生成 + 确认循环 ──────────────────────────────────
         while True:
             doc_response = await model.ainvoke(
                 history + [HumanMessage(content=_DOC_PROMPT)]
@@ -92,29 +93,23 @@ def create_intent_node(model, project_name: str = ""):
             confirm_str = str(confirm).strip()
 
             if confirm_str.lower() == "skip":
-                return {}  # 跳过文档确认
+                break
 
             if confirm_str.lower() in ("ok", "confirm", "yes", "确认", "好的"):
-                break  # 文档已确认
+                break
 
-            # 用户有修改意见 → 带入上下文重新生成
             history.append(doc_response)
             history.append(HumanMessage(content=f"修改意见：{confirm_str}\n请按此修订文档。"))
 
-        # ── 写入文件（存入项目文件夹，不存在则创建）────────────────
+        # ── 保存文档 ─────────────────────────────────────────────
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"requirements_{timestamp}.md"
-        if project_name:
-            save_dir = Path(WORKDIR) / project_name
-            save_dir.mkdir(exist_ok=True)
-        else:
-            save_dir = Path(WORKDIR)
+        save_dir = Path(WORKDIR) / project_name if project_name else Path(WORKDIR)
+        save_dir.mkdir(exist_ok=True)
         save_path = save_dir / filename
         save_path.write_text(final_content, encoding="utf-8")
         print(f"\n\033[32m[OK] 需求文档已保存至 {save_path}\033[0m")
 
-        return {"messages": [HumanMessage(
-            content=f"[需求分析完成，文档已保存至 {save_path}]\n\n{final_content}"
-        )]}
+        return f"[需求分析完成，文档已保存至 {save_path}]\n\n{final_content}"
 
-    return intent_analysis_node
+    return analyze_intent
